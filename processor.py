@@ -7,6 +7,12 @@ from datetime import datetime
 
 import pdfplumber
 from PIL import Image
+import concurrent.futures
+import multiprocessing
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 from config import Config
 from renderer import render_page_to_image, extract_embedded_images
@@ -75,69 +81,97 @@ class DocumentProcessor:
 
         with pdfplumber.open(pdf_path) as pdf:
             page_count = page_count or len(pdf.pages)
+            # Two-phase approach: quick embedded-text scan, then parallel heavy processing
+            embedded_texts: List[str] = []
             for idx, page in enumerate(pdf.pages):
-                page_num = idx + 1
-                page_start_time = time.time()
-                
-                # Extract embedded text first
                 embedded = page.extract_text() or ""
                 embedded_norm = "\n".join([ln.strip() for ln in embedded.splitlines()]).strip()
-                
-                # Decide if OCR is needed
+                embedded_texts.append(embedded_norm)
+
+            # Decide work per page
+            work_plan: List[Dict[str, Any]] = []
+            for idx, embedded_norm in enumerate(embedded_texts):
                 use_ocr = self.config.ocr_enabled and (len(embedded_norm) < self.config.embedded_text_threshold)
+                render_needed = use_ocr or self.config.preserve_images
+                work_plan.append({
+                    'idx': idx,
+                    'embedded_text': embedded_norm,
+                    'use_ocr': use_ocr,
+                    'render_needed': render_needed,
+                })
 
-                # OPTIMIZATION: Only render page if OCR fallback is needed
+            # Compute adaptive worker count
+            cpu_count = multiprocessing.cpu_count() or 1
+            max_by_cpu = cpu_count
+            max_by_mem = cpu_count
+            try:
+                if psutil:
+                    avail_mb = int(psutil.virtual_memory().available / (1024 * 1024))
+                    max_by_mem = max(1, avail_mb // max(1, self.config.worker_mem_estimate_mb))
+            except Exception:
+                max_by_mem = cpu_count
+
+            auto_workers = max(1, min(max_by_cpu, max_by_mem))
+            configured = self.config.max_workers if getattr(self.config, 'max_workers', 0) else auto_workers
+            max_workers = min(auto_workers, configured) if configured > 0 else auto_workers
+            if not getattr(self.config, 'enable_parallel', True):
+                max_workers = 1
+
+            logger.debug(f"Parallel workers: {max_workers} (cpu={cpu_count}, auto={auto_workers})")
+
+            # Worker function
+            def _process_page_item(item: Dict[str, Any]) -> Dict[str, Any]:
+                idx = item['idx']
+                page_num = idx + 1
+                page_start_time = time.time()
+                embedded_text = item['embedded_text']
+                use_ocr = item['use_ocr']
                 page_render_path = None
-                if use_ocr or self.config.preserve_images:
-                    page_render_path = render_page_to_image(pdf_path, idx, self.config.dpi, images_dir)
-                    produced.append(page_render_path)
+                produced_files_local: List[str] = []
 
-                image_files = []
-                # Include the rendered page image if it was produced
+                if item['render_needed']:
+                    try:
+                        page_render_path = render_page_to_image(pdf_path, idx, self.config.dpi, images_dir)
+                        produced_files_local.append(page_render_path)
+                    except Exception as e:
+                        logger.debug(f"Render failed for page {page_num}: {e}")
+
+                image_files: List[str] = []
                 if page_render_path:
                     image_files.append(os.path.relpath(page_render_path, base_dir).replace('\\', '/'))
 
-                # Extract embedded images (optional but useful)
-                embedded_images = []
+                embedded_images: List[Dict[str, Any]] = []
                 embeds = []
                 if self.config.preserve_images and page_render_path:
-                    embeds = extract_embedded_images(pdf_path, idx, extracted_dir)
-                    for p in embeds:
-                        produced.append(p)
-                    rels = [os.path.relpath(p, base_dir).replace('\\', '/') for p in embeds]
-                    image_files.extend(rels)
+                    try:
+                        embeds = extract_embedded_images(pdf_path, idx, extracted_dir)
+                        for p in embeds:
+                            produced_files_local.append(p)
+                        rels = [os.path.relpath(p, base_dir).replace('\\', '/') for p in embeds]
+                        image_files.extend(rels)
+                        if self.config.ocr_enabled:
+                            for p, rel in zip(embeds, rels):
+                                try:
+                                    ensure_tesseract_available()
+                                    img_e = Image.open(p)
+                                    pre_e = preprocess_image(img_e)
+                                    ocr_e = ocr_image_with_layout(pre_e, lang=self.config.lang)
+                                    text_e = (ocr_e.get('text') or '').strip() if isinstance(ocr_e, dict) else (ocr_e or '')
+                                    embedded_images.append({'path': rel, 'text': text_e, 'ocr_data': ocr_e.get('data') if isinstance(ocr_e, dict) else None})
+                                except Exception as e:
+                                    logger.debug(f"Embedded image OCR failed for {p}: {e}")
+                                    embedded_images.append({'path': rel, 'text': '', 'ocr_data': None})
+                        else:
+                            embedded_images = [{'path': rel, 'text': '', 'ocr_data': None} for rel in rels]
+                    except Exception as e:
+                        logger.debug(f"Embedded images extraction failed for page {page_num}: {e}")
 
-                    # OCR each embedded image and collect extracted text
-                    embedded_images = []
-                    if self.config.ocr_enabled:
-                        for p, rel in zip(embeds, rels):
-                            try:
-                                ensure_tesseract_available()
-                                img_e = Image.open(p)
-                                pre_e = preprocess_image(img_e)
-                                ocr_e = ocr_image_with_layout(pre_e, lang=self.config.lang)
-                                text_e = (ocr_e.get('text') or '').strip() if isinstance(ocr_e, dict) else (ocr_e or '')
-                                embedded_images.append({
-                                    'path': rel,
-                                    'text': text_e,
-                                    'ocr_data': ocr_e.get('data') if isinstance(ocr_e, dict) else None,
-                                })
-                            except Exception as e:
-                                logger.debug(f"Embedded image OCR failed for {p}: {e}")
-                                embedded_images.append({'path': rel, 'text': '', 'ocr_data': None})
-                    else:
-                        # If OCR disabled, include path placeholders
-                        embedded_images = [{'path': rel, 'text': '', 'ocr_data': None} for rel in rels]
-
-                # Run diagram detection on the rendered page image and embedded images
-                diagrams_found = []
+                diagrams_found: List[Dict[str, Any]] = []
                 if page_render_path:
                     try:
-                        # page-level diagrams
                         page_diags = detect_diagrams(page_render_path, ocr_lang=self.config.lang)
                         if page_diags:
                             diagrams_found.extend(page_diags)
-                        # embedded image diagrams
                         if self.config.preserve_images:
                             for p in embeds:
                                 try:
@@ -147,53 +181,74 @@ class DocumentProcessor:
                                 except Exception:
                                     continue
                     except Exception as e:
-                        logger.debug(f"Diagram detection error: {e}")
+                        logger.debug(f"Diagram detection error page {page_num}: {e}")
 
-                # Separate text sources
-                embedded_text = embedded_norm
                 ocr_text = ""
                 text_source = "embedded"
-                text_value = embedded_norm
+                text_value = embedded_text
                 ocr_blocks = None
-
                 if use_ocr:
-                    ensure_tesseract_available()
-                    if not page_render_path:
-                        page_render_path = render_page_to_image(pdf_path, idx, self.config.dpi, images_dir)
-                        produced.append(page_render_path)
-                        image_files.insert(0, os.path.relpath(page_render_path, base_dir).replace('\\', '/'))
-                    img = Image.open(page_render_path)
-                    pre = preprocess_image(img)
-                    ocr = ocr_image_with_layout(pre, lang=self.config.lang)
-                    ocr_text = (ocr.get("text") or "").strip()
-                    text_source = "ocr"
-                    text_value = ocr_text
-                    ocr_blocks = ocr.get("data")
+                    try:
+                        ensure_tesseract_available()
+                        if not page_render_path:
+                            page_render_path = render_page_to_image(pdf_path, idx, self.config.dpi, images_dir)
+                            produced_files_local.append(page_render_path)
+                            image_files.insert(0, os.path.relpath(page_render_path, base_dir).replace('\\', '/'))
+                        img = Image.open(page_render_path)
+                        pre = preprocess_image(img)
+                        ocr = ocr_image_with_layout(pre, lang=self.config.lang)
+                        ocr_text = (ocr.get('text') or '').strip()
+                        text_source = 'ocr'
+                        text_value = ocr_text
+                        ocr_blocks = ocr.get('data')
+                    except Exception as e:
+                        logger.debug(f"OCR failed for page {page_num}: {e}")
 
-                # Track extraction timing and source details
-                extraction_time = int((time.time() - page_start_time) * 1000)  # milliseconds
+                extraction_time = int((time.time() - page_start_time) * 1000)
                 source_details = {
-                    "embedded_text_length": len(embedded_text),
-                    "ocr_used": use_ocr,
-                    "threshold": self.config.embedded_text_threshold,
-                    "page_rendered": page_render_path is not None,
-                    "extraction_time_ms": extraction_time,
-                    "text_source": text_source,
+                    'embedded_text_length': len(embedded_text),
+                    'ocr_used': use_ocr,
+                    'threshold': self.config.embedded_text_threshold,
+                    'page_rendered': page_render_path is not None,
+                    'extraction_time_ms': extraction_time,
+                    'text_source': text_source,
                 }
 
-                pages.append(PageResult(
-                    page_number=page_num,
-                    text=text_value,
-                    text_source=text_source,
-                    image_files=image_files,
-                    ocr_blocks=ocr_blocks,
-                    embedded_images=embedded_images,
-                    diagrams=diagrams_found,
-                    embedded_text=embedded_text,
-                    ocr_text=ocr_text,
-                    extraction_time_ms=extraction_time,
-                    source_details=source_details,
-                ))
+                result = {
+                    'page': PageResult(
+                        page_number=page_num,
+                        text=text_value,
+                        text_source=text_source,
+                        image_files=image_files,
+                        ocr_blocks=ocr_blocks,
+                        embedded_images=embedded_images,
+                        diagrams=diagrams_found,
+                        embedded_text=embedded_text,
+                        ocr_text=ocr_text,
+                        extraction_time_ms=extraction_time,
+                        source_details=source_details,
+                    ),
+                    'produced': produced_files_local,
+                }
+                return result
+
+            # Execute work plan with ThreadPoolExecutor to avoid pickling issues and keep memory under control
+            if max_workers <= 1:
+                for item in work_plan:
+                    res = _process_page_item(item)
+                    pages.append(res['page'])
+                    produced.extend(res['produced'])
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = {ex.submit(_process_page_item, item): item for item in work_plan}
+                    for fut in concurrent.futures.as_completed(futures):
+                        try:
+                            res = fut.result()
+                            pages.append(res['page'])
+                            produced.extend(res['produced'])
+                        except Exception as e:
+                            item = futures.get(fut)
+                            logger.debug(f"Page processing failed for item {item}: {e}")
 
         # Exporters
         produced_files: List[str] = []

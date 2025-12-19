@@ -21,6 +21,10 @@ class Config:
     # Misc
     verbose: bool = False
     self_check: bool = False
+    # Parallelism
+    enable_parallel: bool = True
+    max_workers: int = 0  # 0 = auto (based on CPU & memory)
+    worker_mem_estimate_mb: int = 512  # rough memory estimate per worker
 
     def wants(self, fmt: str) -> bool:
         return fmt.lower() in self.formats

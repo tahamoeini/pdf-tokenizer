@@ -90,7 +90,7 @@ TOKEN_LIMIT = 512            # Max tokens per chunk
 QA_GENERATION = True         # Enable Q&A extraction (JSON mode only)
 SUMMARY_GENERATION = True    # Enable summary generation (JSON mode only)
 EXTRACT_METADATA = True      # Enable PDF metadata extraction
-OUTPUT_FORMAT = "markdown"   # Output format: "markdown" or "json"
+OUTPUT_FORMAT = "json"   # Output format: "markdown" or "json"
 PRESERVE_IMAGES = True       # Extract and convert images to text
 PRESERVE_STRUCTURE = True    # Preserve document structure
 MIN_CHUNK_LENGTH = 50        # Minimum characters per valid chunk
@@ -131,12 +131,64 @@ def estimate_tokens(text):
 def preprocess_image(img_pil):
     """Preprocesses an image for better OCR accuracy."""
     try:
+        # Convert to grayscale and upscale for better OCR
         img = np.array(img_pil.convert("L"))
-        _, img = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        h, w = img.shape[:2]
+        scale = 2 if max(w, h) < 2000 else 1
+        if scale != 1:
+            img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+
+        # Denoise and enhance contrast
+        img = cv2.fastNlMeansDenoising(img, None, h=10)
+        img = cv2.equalizeHist(img)
+
+        # Adaptive thresholding for varying backgrounds
+        img = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 35, 15)
+
+        # Morphological closing to connect broken strokes
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel)
+
         return Image.fromarray(img)
     except Exception as e:
         logger.warning(f"⚠️ Image preprocessing failed: {e}")
         return img_pil
+
+
+def ocr_image_with_layout(img_pil, lang='eng'):
+    """Run OCR and return text using layout-aware parsing (word->line grouping).
+    Returns a cleaned textual representation that preserves layout order.
+    """
+    try:
+        # Use image_to_data to get word-level boxes and line numbers
+        data = pytesseract.image_to_data(img_pil, lang=lang, output_type=pytesseract.Output.DICT)
+        n_boxes = len(data.get('level', []))
+        lines = {}
+        for i in range(n_boxes):
+            block = data['block_num'][i]
+            par = data['par_num'][i]
+            line = data['line_num'][i]
+            text = data['text'][i].strip()
+            if not text:
+                continue
+            key = (block, par, line)
+            lines.setdefault(key, []).append(text)
+
+        ordered = []
+        for key in sorted(lines.keys()):
+            ordered.append(' '.join(lines[key]))
+
+        # Fallback to plain OCR string if nothing found
+        raw = pytesseract.image_to_string(img_pil, lang=lang)
+        text = '\n'.join(ordered) if ordered else raw
+        return text.strip()
+    except Exception as e:
+        logger.debug(f"⚠️ OCR layout parsing failed: {e}")
+        try:
+            return pytesseract.image_to_string(img_pil, lang=lang)
+        except Exception:
+            return ""
 
 def extract_pdf_metadata(pdf_path):
     """Extracts metadata from PDF."""
@@ -177,10 +229,15 @@ def extract_images_and_charts(pdf_path, page_num, output_subdir):
                 img_path = os.path.join(output_subdir, f"page_{page_num + 1}_img_{img_index + 1}.png")
                 pix.save(img_path)
                 
-                # Extract text from image using OCR
+                # Extract text from image using improved OCR + layout parsing
                 img_pil = Image.open(img_path)
-                img_text = pytesseract.image_to_string(preprocess_image(img_pil), lang="eng")
+                pre = preprocess_image(img_pil)
+                img_text = ocr_image_with_layout(pre, lang='eng')
                 
+                if not img_text.strip():
+                    # As a fallback, try plain OCR again
+                    img_text = pytesseract.image_to_string(pre, lang='eng')
+
                 images_data.append({
                     "type": "image",
                     "page": page_num + 1,

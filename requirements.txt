@@ -1,0 +1,11 @@
+pymupdf
+pdfplumber
+pytesseract
+nltk
+opencv-python-headless
+Pillow
+tqdm
+unidecode
+numpy
+# optional but recommended for accurate token counts
+tiktoken

@@ -26,15 +26,26 @@ warnings.filterwarnings('ignore')
 def setup_logging(output_dir):
     """Initialize logging system."""
     log_file = os.path.join(output_dir, f"processing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    return logging.getLogger(__name__)
+
+    # File handler (UTF-8)
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+    # Stream handler with UTF-8 wrapper to avoid Windows console encoding errors
+    try:
+        stream = sys.stdout
+        if hasattr(sys.stdout, 'buffer'):
+            stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        stream_handler = logging.StreamHandler(stream)
+        stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    except Exception:
+        stream_handler = logging.StreamHandler(sys.stdout)
+
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
 
 # --- Dependency & Environment Checks ---
 def check_dependencies():

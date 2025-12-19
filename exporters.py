@@ -57,26 +57,53 @@ class MarkdownExporter:
 
         for p in pages:
             md.append(f"## Page {p['page_number']}\n\n")
-            text = (p.get("text") or "").strip()
-            if text:
-                md.append(text + "\n\n")
+            
+            # Show source information
+            source_details = p.get("source_details", {})
+            if source_details:
+                md.append(f"**Extraction Source:** {source_details.get('text_source', 'unknown').upper()}\n")
+                if source_details.get('ocr_used'):
+                    md.append(f"- OCR Fallback: Used (embedded text too short)\n")
+                md.append(f"- Extraction Time: {source_details.get('extraction_time_ms', 0)}ms\n\n")
+            
+            # Embedded text section
+            embedded_text = (p.get("embedded_text") or "").strip()
+            if embedded_text:
+                md.append(f"### 📄 Extracted Text (Embedded)\n\n{embedded_text}\n\n")
+            
+            # OCR text section
+            ocr_text = (p.get("ocr_text") or "").strip()
+            if ocr_text:
+                md.append(f"### 🔍 Extracted Text (OCR)\n\n{ocr_text}\n\n")
+            
+            # Fallback to original text if no separation
+            if not embedded_text and not ocr_text:
+                text = (p.get("text") or "").strip()
+                if text:
+                    md.append(text + "\n\n")
+            
             images = p.get("image_files") or []
             for rel in images:
                 md.append(f"![Page {p['page_number']}]({rel})\n\n")
 
             # Embedded images metadata (with OCR text)
             embedded = p.get("embedded_images") or []
+            if embedded:
+                md.append(f"### 🖼️ Images in Page\n\n")
             for ei in embedded:
                 rel = ei.get('path')
                 text_e = ei.get('text') or ''
                 if rel:
                     md.append(f"![Embedded image p{p['page_number']}]({rel})\n\n")
                 if text_e:
-                    md.append(f"**Extracted from image:**\n\n{text_e}\n\n")
+                    md.append(f"**Text from image:**\n\n{text_e}\n\n")
+            
             # Diagrams
             diagrams = p.get("diagrams") or []
+            if diagrams:
+                md.append(f"### 📊 Detected Diagrams\n\n")
             for d in diagrams:
-                md.append(f"**Detected diagram image:** {d.get('image')}\n\n")
+                md.append(f"**Diagram:** {d.get('image')}\n\n")
                 for shape in d.get('shapes', []):
                     bbox = shape.get('bbox')
                     if bbox:

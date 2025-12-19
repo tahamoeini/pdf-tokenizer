@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -25,6 +26,11 @@ class PageResult:
     ocr_blocks: Optional[Dict[str, Any]] = None
     embedded_images: List[Dict[str, Any]] = field(default_factory=list)
     diagrams: List[Dict[str, Any]] = field(default_factory=list)
+    # Source tracking
+    embedded_text: str = ""
+    ocr_text: str = ""
+    extraction_time_ms: int = 0
+    source_details: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -71,20 +77,30 @@ class DocumentProcessor:
             page_count = page_count or len(pdf.pages)
             for idx, page in enumerate(pdf.pages):
                 page_num = idx + 1
+                page_start_time = time.time()
+                
+                # Extract embedded text first
                 embedded = page.extract_text() or ""
                 embedded_norm = "\n".join([ln.strip() for ln in embedded.splitlines()]).strip()
+                
+                # Decide if OCR is needed
                 use_ocr = self.config.ocr_enabled and (len(embedded_norm) < self.config.embedded_text_threshold)
 
-                page_render_path = render_page_to_image(pdf_path, idx, self.config.dpi, images_dir)
-                produced.append(page_render_path)
+                # OPTIMIZATION: Only render page if OCR fallback is needed
+                page_render_path = None
+                if use_ocr or self.config.preserve_images:
+                    page_render_path = render_page_to_image(pdf_path, idx, self.config.dpi, images_dir)
+                    produced.append(page_render_path)
 
                 image_files = []
-                # Always include the rendered page image first
-                image_files.append(os.path.relpath(page_render_path, base_dir).replace('\\', '/'))
+                # Include the rendered page image if it was produced
+                if page_render_path:
+                    image_files.append(os.path.relpath(page_render_path, base_dir).replace('\\', '/'))
 
                 # Extract embedded images (optional but useful)
                 embedded_images = []
-                if self.config.preserve_images:
+                embeds = []
+                if self.config.preserve_images and page_render_path:
                     embeds = extract_embedded_images(pdf_path, idx, extracted_dir)
                     for p in embeds:
                         produced.append(p)
@@ -115,35 +131,55 @@ class DocumentProcessor:
 
                 # Run diagram detection on the rendered page image and embedded images
                 diagrams_found = []
-                try:
-                    # page-level diagrams
-                    page_diags = detect_diagrams(page_render_path, ocr_lang=self.config.lang)
-                    if page_diags:
-                        diagrams_found.extend(page_diags)
-                    # embedded image diagrams
-                    if self.config.preserve_images:
-                        for p in embeds:
-                            try:
-                                ed = detect_diagrams(p, ocr_lang=self.config.lang)
-                                if ed:
-                                    diagrams_found.extend(ed)
-                            except Exception:
-                                continue
-                except Exception as e:
-                    logger.debug(f"Diagram detection error: {e}")
+                if page_render_path:
+                    try:
+                        # page-level diagrams
+                        page_diags = detect_diagrams(page_render_path, ocr_lang=self.config.lang)
+                        if page_diags:
+                            diagrams_found.extend(page_diags)
+                        # embedded image diagrams
+                        if self.config.preserve_images:
+                            for p in embeds:
+                                try:
+                                    ed = detect_diagrams(p, ocr_lang=self.config.lang)
+                                    if ed:
+                                        diagrams_found.extend(ed)
+                                except Exception:
+                                    continue
+                    except Exception as e:
+                        logger.debug(f"Diagram detection error: {e}")
 
+                # Separate text sources
+                embedded_text = embedded_norm
+                ocr_text = ""
                 text_source = "embedded"
                 text_value = embedded_norm
                 ocr_blocks = None
 
                 if use_ocr:
                     ensure_tesseract_available()
+                    if not page_render_path:
+                        page_render_path = render_page_to_image(pdf_path, idx, self.config.dpi, images_dir)
+                        produced.append(page_render_path)
+                        image_files.insert(0, os.path.relpath(page_render_path, base_dir).replace('\\', '/'))
                     img = Image.open(page_render_path)
                     pre = preprocess_image(img)
                     ocr = ocr_image_with_layout(pre, lang=self.config.lang)
-                    text_value = (ocr.get("text") or "").strip()
+                    ocr_text = (ocr.get("text") or "").strip()
                     text_source = "ocr"
+                    text_value = ocr_text
                     ocr_blocks = ocr.get("data")
+
+                # Track extraction timing and source details
+                extraction_time = int((time.time() - page_start_time) * 1000)  # milliseconds
+                source_details = {
+                    "embedded_text_length": len(embedded_text),
+                    "ocr_used": use_ocr,
+                    "threshold": self.config.embedded_text_threshold,
+                    "page_rendered": page_render_path is not None,
+                    "extraction_time_ms": extraction_time,
+                    "text_source": text_source,
+                }
 
                 pages.append(PageResult(
                     page_number=page_num,
@@ -153,6 +189,10 @@ class DocumentProcessor:
                     ocr_blocks=ocr_blocks,
                     embedded_images=embedded_images,
                     diagrams=diagrams_found,
+                    embedded_text=embedded_text,
+                    ocr_text=ocr_text,
+                    extraction_time_ms=extraction_time,
+                    source_details=source_details,
                 ))
 
         # Exporters
@@ -189,9 +229,13 @@ class DocumentProcessor:
                         "page_number": p.page_number,
                         "text_source": p.text_source,
                         "text": p.text,
+                        "embedded_text": getattr(p, 'embedded_text', ''),
+                        "ocr_text": getattr(p, 'ocr_text', ''),
+                        "source_details": getattr(p, 'source_details', {}),
+                        "extraction_time_ms": getattr(p, 'extraction_time_ms', 0),
                         "image_files": p.image_files,
-                            "embedded_images": p.embedded_images,
-                            "diagrams": p.diagrams,
+                        "embedded_images": p.embedded_images,
+                        "diagrams": p.diagrams,
                     }
                     for p in pages
                 ],
@@ -205,8 +249,12 @@ class DocumentProcessor:
                 {
                     "page_number": p.page_number,
                     "text": p.text,
+                    "embedded_text": getattr(p, 'embedded_text', ''),
+                    "ocr_text": getattr(p, 'ocr_text', ''),
+                    "source_details": getattr(p, 'source_details', {}),
                     "image_files": p.image_files,
                     "embedded_images": p.embedded_images,
+                    "diagrams": p.diagrams,
                 } for p in pages
             ], metadata={"title": metadata.get("title") or filename, "page_count": page_count, "filename": filename}))
 

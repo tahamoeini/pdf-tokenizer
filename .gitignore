@@ -12,6 +12,12 @@ venv/
 build/
 dist/
 *.egg-info/
+*.spec
+
+# PyInstaller build artifacts
+*.exe
+build/
+dist/
 
 # VSCode
 .vscode/
@@ -29,3 +35,4 @@ processed_data/
 # Ignore sample or test files in resources
 resources/sample.pdf
 resources/sample_image.png
+resources/*.pdf

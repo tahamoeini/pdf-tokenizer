@@ -7,5 +7,6 @@ Pillow
 tqdm
 unidecode
 numpy
-# optional but recommended for accurate token counts
 tiktoken
+PyQt5
+PyInstaller

@@ -31,8 +31,18 @@ def extract_embedded_images(pdf_path: str, page_index: int, out_dir: str) -> Lis
         for idx, img in enumerate(image_list, start=1):
             xref = img[0]
             pix = fitz.Pixmap(doc, xref)
-            if pix.n - pix.alpha < 4:
-                pix = fitz.Pixmap(fitz.csRGB, pix)
+            # Convert unsupported/CMYK colorspaces to RGB before saving as PNG
+            try:
+                if pix.n >= 4:
+                    rgb = fitz.Pixmap(fitz.csRGB, pix)
+                    pix = rgb
+            except Exception:
+                # Fallback: attempt to create an RGB copy; if this fails, skip image
+                try:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                except Exception:
+                    continue
+
             out_path = os.path.join(out_dir, f"page_{page_index+1:03}_img_{idx}{essential_image_ext}")
             pix.save(out_path)
             paths.append(out_path)

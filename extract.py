@@ -1,232 +1,542 @@
 import os
 import json
+import sys
+import logging
 import fitz  # PyMuPDF
 import pdfplumber
 import pytesseract
-import pandas as pd
 import unicodedata
 import nltk
 import re
 import cv2
 import numpy as np
-from langdetect import detect
 from PIL import Image
 from tqdm import tqdm
 from unidecode import unidecode
-from datasets import Dataset  # Hugging Face Dataset format
+from datetime import datetime
+import shutil
+import warnings
+import io
+from pathlib import Path
 
-# --- NLTK Resource Checks ---
-# Download 'punkt' if missing
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
-# Download 'punkt_tab' if missing
-try:
-    nltk.data.find('tokenizers/punkt_tab')
-except LookupError:
-    nltk.download('punkt_tab')
+# --- Logging Configuration ---
+def setup_logging(output_dir):
+    """Initialize logging system."""
+    log_file = os.path.join(output_dir, f"processing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return logging.getLogger(__name__)
 
-# --- CONFIGURATION ---
+# --- Dependency & Environment Checks ---
+def check_dependencies():
+    """Verify all required dependencies are installed and accessible."""
+    logger = logging.getLogger(__name__)
+    issues = []
+    
+    # Check Tesseract OCR
+    try:
+        pytesseract.get_tesseract_version()
+        logger.info("✅ Tesseract OCR found")
+    except pytesseract.TesseractNotFoundError:
+        issues.append("❌ Tesseract OCR not found. Install from: https://github.com/UB-Mannheim/tesseract/wiki")
+    
+    # Check NLTK resources
+    for resource in ['tokenizers/punkt', 'tokenizers/punkt_tab']:
+        try:
+            nltk.data.find(resource)
+            logger.info(f"✅ NLTK resource '{resource}' found")
+        except LookupError:
+            logger.info(f"📥 Downloading NLTK resource: {resource}")
+            nltk.download(resource, quiet=True)
+    
+    # Check tiktoken for token counting
+    try:
+        import tiktoken
+        logger.info("✅ tiktoken available for token-based chunking")
+    except ImportError:
+        logger.warning("⚠️ tiktoken not installed. Token-based chunking will use estimate.")
+    
+    if issues:
+        logger.error(f"Dependency check failed:\n" + "\n".join(issues))
+        return False
+    
+    return True
+
+# --- CONFIGURATION & VALIDATION ---
 INPUT_DIR = "resources"      # Directory containing PDFs
 OUTPUT_DIR = "processed_data"
-CHUNK_SIZE = 512             # Max token chunking size for fine-tuning
-QA_GENERATION = True         # Enable Q&A extraction
-SUMMARY_GENERATION = True    # Enable summary generation
-RAG_FORMAT = True            # Enable embedding-ready chunking
-EXPORT_HF = False            # Auto-upload dataset to Hugging Face (set your repo)
+CHUNK_SIZE = 512             # Target chunk size (characters)
+TOKEN_LIMIT = 512            # Max tokens per chunk
+QA_GENERATION = True         # Enable Q&A extraction (JSON mode only)
+SUMMARY_GENERATION = True    # Enable summary generation (JSON mode only)
+EXTRACT_METADATA = True      # Enable PDF metadata extraction
+OUTPUT_FORMAT = "markdown"   # Output format: "markdown" or "json"
+PRESERVE_IMAGES = True       # Extract and convert images to text
+PRESERVE_STRUCTURE = True    # Preserve document structure
+MIN_CHUNK_LENGTH = 50        # Minimum characters per valid chunk
+IMAGES_SUBDIR = "extracted_images"
+
+def validate_config():
+    """Validate configuration at startup."""
+    logger = logging.getLogger(__name__)
+    
+    if not os.path.exists(INPUT_DIR):
+        logger.error(f"❌ Input directory '{INPUT_DIR}' not found!")
+        return False
+    
+    if OUTPUT_FORMAT not in ["markdown", "json"]:
+        logger.error(f"❌ Invalid OUTPUT_FORMAT. Use 'markdown' or 'json'")
+        return False
+    
+    logger.info(f"✅ Configuration validated (Output: {OUTPUT_FORMAT})")
+    return True
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Initialize logging
+logger = setup_logging(OUTPUT_DIR)
+
 # --- Helper Functions ---
 
-def preprocess_image(img_pil):
-    """
-    Preprocesses an image (grayscale, binarization) to improve OCR accuracy.
-    """
-    img = np.array(img_pil.convert("L"))  # Convert to grayscale
-    _, img = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return Image.fromarray(img)
+def estimate_tokens(text):
+    """Estimate token count (1 token ≈ 4 characters for English)."""
+    try:
+        import tiktoken
+        encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        return len(encoding.encode(text))
+    except (ImportError, KeyError):
+        return len(text) // 4
 
-def extract_text_from_pdf(pdf_path):
-    """
-    Extracts structured text from a PDF using PyMuPDF. Falls back to OCR
-    for pages with no extractable text.
-    """
+def preprocess_image(img_pil):
+    """Preprocesses an image for better OCR accuracy."""
+    try:
+        img = np.array(img_pil.convert("L"))
+        _, img = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return Image.fromarray(img)
+    except Exception as e:
+        logger.warning(f"⚠️ Image preprocessing failed: {e}")
+        return img_pil
+
+def extract_pdf_metadata(pdf_path):
+    """Extracts metadata from PDF."""
     try:
         doc = fitz.open(pdf_path)
-        full_text = []
-
-        for page_num, page in enumerate(doc):
-            text = page.get_text("text")
-
-            # If no text, use OCR
-            if not text.strip():
-                print(f"⚠️ OCR required for page {page_num + 1} in {pdf_path}")
-                pixmap = page.get_pixmap()
-                img_pil = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
-
-                # Run OCR on the preprocessed image
-                text = pytesseract.image_to_string(
-                    preprocess_image(img_pil),
-                    lang="eng"  # Adjust if multi-language needed
-                )
-
-                # Optional debug: save OCR images/text
-                img_pil.save(os.path.join(OUTPUT_DIR, f"debug_{os.path.basename(pdf_path)}_page_{page_num + 1}.png"))
-                with open(os.path.join(OUTPUT_DIR, f"debug_{os.path.basename(pdf_path)}_page_{page_num + 1}.txt"), "w", encoding="utf-8") as f:
-                    f.write(text)
-
-            # Check if extracted text is non-trivial
-            if text and len(text.strip()) > 10:
-                full_text.append(text.strip())
-
-        if not full_text:
-            print(f"⚠️ No extractable text found in {pdf_path}. Skipping...")
-            return ""
-
-        return "\n".join(full_text)
-
+        metadata = doc.metadata or {}
+        page_count = len(doc)
+        doc.close()
+        
+        return {
+            "title": metadata.get("title", "Unknown"),
+            "author": metadata.get("author", "Unknown"),
+            "subject": metadata.get("subject", ""),
+            "creator": metadata.get("creator", ""),
+            "page_count": page_count
+        }
     except Exception as e:
-        print(f"❌ Error extracting text from {pdf_path}: {str(e)}")
-        return ""
+        logger.warning(f"⚠️ Failed to extract metadata: {e}")
+        return {}
 
-def clean_text(text):
-    """
-    Removes artifacts, normalizes encoding, and cleans extracted text.
-    """
-    # Fix Unicode issues
-    text = unicodedata.normalize("NFKD", text)
-    # Remove non-ASCII characters
-    text = unidecode(text)
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-    # Remove dates (common format: mm/dd/yyyy)
-    text = re.sub(r'\d{1,2}/\d{1,2}/\d{2,4}', '', text)
-    # Remove page numbers
-    text = re.sub(r'Page \d+|page \d+', '', text)
-    # Remove common boilerplate terms
-    text = re.sub(r'\b(?:table of contents|introduction|conclusion)\b', '', text, flags=re.I)
-    return text
+def extract_images_and_charts(pdf_path, page_num, output_subdir):
+    """Extracts images from a PDF page and converts to text."""
+    images_data = []
+    
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc[page_num]
+        image_list = page.get_images(full=True)
+        
+        for img_index, img in enumerate(image_list):
+            try:
+                xref = img[0]
+                pix = fitz.Pixmap(doc, xref)
+                
+                if pix.n - pix.alpha < 4:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                
+                img_path = os.path.join(output_subdir, f"page_{page_num + 1}_img_{img_index + 1}.png")
+                pix.save(img_path)
+                
+                # Extract text from image using OCR
+                img_pil = Image.open(img_path)
+                img_text = pytesseract.image_to_string(preprocess_image(img_pil), lang="eng")
+                
+                images_data.append({
+                    "type": "image",
+                    "page": page_num + 1,
+                    "index": img_index + 1,
+                    "path": img_path,
+                    "extracted_text": img_text.strip() if img_text.strip() else "[Visual content - diagram/chart/image]",
+                    "markdown_ref": f"![Image p{page_num + 1}](extracted_images/page_{page_num + 1}_img_{img_index + 1}.png)"
+                })
+                
+                logger.debug(f"📸 Extracted image from page {page_num + 1}")
+                
+            except Exception as e:
+                logger.debug(f"⚠️ Failed to extract image {img_index}: {e}")
+                continue
+        
+        doc.close()
+        return images_data
+        
+    except Exception as e:
+        logger.debug(f"⚠️ Error extracting images: {e}")
+        return []
 
-def split_into_chunks(text, chunk_size=CHUNK_SIZE):
-    """
-    Splits text into smaller chunks based on sentences. 
-    Ensures each chunk is below 'chunk_size' characters.
-    """
+def extract_with_structure(pdf_path, output_subdir):
+    """Extracts text with structure preservation using pdfplumber."""
+    structured_content = []
+    
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                page_content = {
+                    "page": page_num + 1,
+                    "elements": []
+                }
+                
+                # Extract tables
+                tables = page.extract_tables()
+                if tables:
+                    for table_idx, table in enumerate(tables):
+                        if not table:
+                            continue
+                        
+                        # Build markdown table
+                        header = table[0]
+                        table_md = "| " + " | ".join([str(cell) if cell else "" for cell in header]) + " |\n"
+                        table_md += "|" + "|".join(["---"] * len(header)) + "|\n"
+                        
+                        for row in table[1:]:
+                            table_md += "| " + " | ".join([str(cell) if cell else "" for cell in row]) + " |\n"
+                        
+                        page_content["elements"].append({
+                            "type": "table",
+                            "content": table_md.strip()
+                        })
+                
+                # Extract text with structure detection
+                text = page.extract_text()
+                if text:
+                    lines = text.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        element_type = "paragraph"
+                        
+                        # Detect headings
+                        if len(line) < 100 and (line.isupper() or re.match(r'^(Chapter|Section|Part|Title)', line, re.I)):
+                            element_type = "heading"
+                        
+                        # Detect lists
+                        if line.startswith(("•", "-", "*", "◦", "○")) or re.match(r'^(\d+\.|[a-z]\.|[A-Z]\.)', line):
+                            element_type = "list_item"
+                        
+                        page_content["elements"].append({
+                            "type": element_type,
+                            "content": line
+                        })
+                
+                # Extract images
+                if PRESERVE_IMAGES:
+                    images = extract_images_and_charts(pdf_path, page_num, output_subdir)
+                    for img in images:
+                        page_content["elements"].append({
+                            "type": "image",
+                            "content": img["extracted_text"],
+                            "markdown_ref": img["markdown_ref"]
+                        })
+                
+                if page_content["elements"]:
+                    structured_content.append(page_content)
+        
+        return structured_content
+        
+    except Exception as e:
+        logger.error(f"❌ Error extracting structured content: {e}")
+        return []
+
+def convert_to_markdown(pdf_data, structured_content):
+    """Converts extracted content to markdown with full structure preservation."""
+    md_content = []
+    
+    # Document header with metadata
+    if pdf_data.get("metadata"):
+        meta = pdf_data["metadata"]
+        title = meta.get("title") or pdf_data.get("filename", "Document")
+        md_content.append(f"# {title}\n")
+        
+        if meta.get("author") and meta["author"] != "Unknown":
+            md_content.append(f"**Author:** {meta['author']}")
+        if meta.get("subject"):
+            md_content.append(f"**Subject:** {meta['subject']}")
+        if meta.get("page_count"):
+            md_content.append(f"**Total Pages:** {meta['page_count']}")
+        
+        md_content.append("\n---\n")
+    
+    # Process each page
+    for page_content in structured_content:
+        page_num = page_content["page"]
+        md_content.append(f"## Page {page_num}\n")
+        
+        for element in page_content["elements"]:
+            elem_type = element["type"]
+            content = element.get("content", "").strip()
+            
+            if not content:
+                continue
+            
+            if elem_type == "heading":
+                md_content.append(f"### {content}\n")
+                
+            elif elem_type == "list_item":
+                # Clean and reformat as markdown list
+                cleaned = re.sub(r'^[•\-*◦○]?\s*', '', content)
+                md_content.append(f"- {cleaned}")
+                
+            elif elem_type == "table":
+                md_content.append(f"{content}\n")
+                
+            elif elem_type == "image":
+                if element.get("markdown_ref"):
+                    md_content.append(f"{element['markdown_ref']}\n")
+                
+                if content and "[Visual" not in content:
+                    md_content.append(f"*[Image Content]*: {content}\n")
+                
+            elif elem_type == "paragraph":
+                md_content.append(f"{content}\n")
+        
+        md_content.append("\n---\n")
+    
+    return "\n".join(md_content)
+
+def split_into_chunks(text, chunk_size=CHUNK_SIZE, token_limit=TOKEN_LIMIT):
+    """Splits text into chunks with token awareness (JSON mode only)."""
     sentences = nltk.sent_tokenize(text)
     chunks = []
     current_chunk = ""
 
     for sentence in sentences:
-        if len(current_chunk) + len(sentence) < chunk_size:
-            current_chunk += " " + sentence
+        test_chunk = (current_chunk + " " + sentence).strip()
+        
+        if len(test_chunk) < chunk_size and estimate_tokens(test_chunk) < token_limit:
+            current_chunk = test_chunk
         else:
-            chunks.append(current_chunk.strip())
+            if len(current_chunk.strip()) >= MIN_CHUNK_LENGTH:
+                chunks.append(current_chunk.strip())
             current_chunk = sentence
 
-    if current_chunk:
+    if len(current_chunk.strip()) >= MIN_CHUNK_LENGTH:
         chunks.append(current_chunk.strip())
 
-    # Filter out empty or near-empty chunks
-    chunks = [c for c in chunks if len(c.strip()) > 0]
-
+    logger.debug(f"📊 Created {len(chunks)} chunks")
     return chunks
 
 def generate_qa_pairs(text_chunks):
-    """
-    Creates basic Q&A pairs from text chunks.
-    """
+    """Creates Q&A pairs from chunks (JSON mode only)."""
     qa_pairs = []
-    for chunk in text_chunks:
-        question = "What is discussed in this section?"
-        answer = chunk
-        qa_pairs.append({"question": question, "answer": answer})
-    return qa_pairs
-
-def generate_summary(text_chunks):
-    """
-    Generates a simple summary by taking the first sentence from each chunk.
-    """
-    summaries = []
+    
     for chunk in text_chunks:
         sentences = nltk.sent_tokenize(chunk)
         if not sentences:
-            # Skip or handle empty chunk
-            summaries.append({"original_text": chunk, "summary": ""})
             continue
-        first_sentence = sentences[0]
-        summaries.append({"original_text": chunk, "summary": first_sentence})
+        
+        qa_pairs.append({
+            "question": "What is the main topic?",
+            "answer": chunk
+        })
+    
+    return qa_pairs
+
+def generate_summary(text_chunks):
+    """Generates summaries from chunks (JSON mode only)."""
+    summaries = []
+    
+    for chunk in text_chunks:
+        sentences = nltk.sent_tokenize(chunk)
+        summary = sentences[0] if sentences else ""
+        
+        summaries.append({
+            "original_text": chunk[:100] + ("..." if len(chunk) > 100 else ""),
+            "summary": summary
+        })
+    
     return summaries
 
 def process_pdf(pdf_path):
-    """
-    Full pipeline for a single PDF:
-    1. Extract text (or OCR fallback)
-    2. Clean text
-    3. Chunk text
-    4. Generate optional QA pairs & summaries
-    """
+    """Main PDF processing pipeline."""
     try:
-        text = extract_text_from_pdf(pdf_path)
-        if not text.strip():
-            print(f"⚠️ Warning: No text found in {pdf_path}. Skipping...")
+        filename = os.path.basename(pdf_path)
+        logger.info(f"📖 Processing: {filename}")
+        
+        # Create subdirectory for this PDF's images
+        pdf_images_dir = os.path.join(OUTPUT_DIR, IMAGES_SUBDIR, filename.replace('.pdf', ''))
+        os.makedirs(pdf_images_dir, exist_ok=True)
+        
+        # Extract metadata
+        metadata = extract_pdf_metadata(pdf_path) if EXTRACT_METADATA else {}
+        
+        # Extract content with structure
+        structured_content = extract_with_structure(pdf_path, pdf_images_dir)
+        
+        if not structured_content:
+            logger.warning(f"⚠️ No content extracted from {filename}")
             return None
 
-        text = clean_text(text)
-        text_chunks = split_into_chunks(text)
-
-        if not text_chunks:
-            print(f"⚠️ Warning: No valid chunks extracted from {pdf_path}. Skipping...")
-            return None
-
-        # Prepare final output data
-        output = {"filename": os.path.basename(pdf_path), "chunks": text_chunks}
-
-        if QA_GENERATION:
-            output["qa_pairs"] = generate_qa_pairs(text_chunks)
-
-        if SUMMARY_GENERATION:
-            output["summaries"] = generate_summary(text_chunks)
-
-        return output
+        # Prepare output based on format
+        if OUTPUT_FORMAT == "markdown":
+            # Generate markdown document
+            pdf_data = {
+                "filename": filename,
+                "metadata": metadata
+            }
+            md_content = convert_to_markdown(pdf_data, structured_content)
+            
+            # Save markdown file
+            md_filename = os.path.join(OUTPUT_DIR, filename.replace('.pdf', '.md'))
+            with open(md_filename, 'w', encoding='utf-8') as f:
+                f.write(md_content)
+            
+            logger.info(f"✅ Generated markdown: {md_filename}")
+            
+            return {
+                "filename": filename,
+                "output": md_filename,
+                "format": "markdown",
+                "pages": len(structured_content)
+            }
+        
+        else:  # JSON format
+            # Generate chunks and Q&A
+            full_text = "\n".join([
+                elem.get("content", "") 
+                for page in structured_content 
+                for elem in page.get("elements", [])
+            ])
+            
+            text_chunks = split_into_chunks(full_text)
+            
+            output = {
+                "filename": filename,
+                "metadata": metadata,
+                "chunks": text_chunks,
+                "chunk_count": len(text_chunks)
+            }
+            
+            if QA_GENERATION:
+                output["qa_pairs"] = generate_qa_pairs(text_chunks)
+            
+            if SUMMARY_GENERATION:
+                output["summaries"] = generate_summary(text_chunks)
+            
+            logger.info(f"✅ Processed {filename}: {len(text_chunks)} chunks")
+            return output
 
     except Exception as e:
-        print(f"❌ Unexpected error in {pdf_path}: {str(e)}")
+        logger.error(f"❌ Error processing {pdf_path}: {e}", exc_info=True)
         return None
 
 def process_pdfs(input_dir=INPUT_DIR):
-    """
-    Loops over all PDFs in 'input_dir' and applies 'process_pdf' to each.
-    Saves extracted data to JSON and logs failures in 'failed_pdfs.txt'.
-    """
+    """Batch process all PDFs in directory."""
+    logger.info("=" * 70)
+    logger.info("PDF TOKENIZER & STRUCTURE EXTRACTOR - Starting Processing")
+    logger.info(f"Output Format: {OUTPUT_FORMAT.upper()}")
+    logger.info("=" * 70)
+    
     pdf_files = [f for f in os.listdir(input_dir) if f.lower().endswith(".pdf")]
+    
+    if not pdf_files:
+        logger.error(f"❌ No PDF files found in '{input_dir}'")
+        return
+    
+    logger.info(f"📁 Found {len(pdf_files)} PDF(s)\n")
+    
     all_data = []
     failed_pdfs = []
+    statistics = {
+        "total_pdfs": len(pdf_files),
+        "successful": 0,
+        "failed": 0,
+        "format": OUTPUT_FORMAT,
+        "start_time": datetime.now().isoformat()
+    }
 
     for pdf_file in tqdm(pdf_files, desc="Processing PDFs"):
         pdf_path = os.path.join(input_dir, pdf_file)
-        processed_data = process_pdf(pdf_path)
-
-        if processed_data:
-            all_data.append(processed_data)
-        else:
+        
+        try:
+            processed_data = process_pdf(pdf_path)
+            
+            if processed_data:
+                all_data.append(processed_data)
+                statistics["successful"] += 1
+            else:
+                failed_pdfs.append(pdf_file)
+                statistics["failed"] += 1
+        except Exception as e:
+            logger.error(f"❌ Exception: {e}")
             failed_pdfs.append(pdf_file)
+            statistics["failed"] += 1
 
-    # Log problematic PDFs
+    statistics["end_time"] = datetime.now().isoformat()
+
+    # Log failures
     if failed_pdfs:
-        with open(os.path.join(OUTPUT_DIR, "failed_pdfs.txt"), "w") as f:
+        failed_log = os.path.join(OUTPUT_DIR, "failed_pdfs.txt")
+        with open(failed_log, "w", encoding="utf-8") as f:
             f.write("\n".join(failed_pdfs))
-        print(f"⚠️ Logged {len(failed_pdfs)} problematic PDFs in 'failed_pdfs.txt'.")
+        logger.warning(f"⚠️ {len(failed_pdfs)} failed PDFs logged")
 
-    # Save structured data
-    output_json = os.path.join(OUTPUT_DIR, "processed_data.json")
-    with open(output_json, "w", encoding="utf-8") as f:
-        json.dump(all_data, f, indent=4)
+    # Save data
+    if OUTPUT_FORMAT == "json":
+        output_json = os.path.join(OUTPUT_DIR, "processed_data.json")
+        with open(output_json, "w", encoding="utf-8") as f:
+            json.dump(all_data, f, indent=2, ensure_ascii=False)
+        logger.info(f"💾 Data saved to: {output_json}")
 
-    print(f"✅ Processed {len(pdf_files)} PDFs. Output saved to {OUTPUT_DIR}.")
+    # Save statistics
+    stats_file = os.path.join(OUTPUT_DIR, "processing_stats.json")
+    with open(stats_file, "w", encoding="utf-8") as f:
+        json.dump(statistics, f, indent=2)
+
+    # Summary
+    logger.info("=" * 70)
+    logger.info("PROCESSING COMPLETE")
+    logger.info("=" * 70)
+    logger.info(f"✅ Successful: {statistics['successful']}/{statistics['total_pdfs']}")
+    logger.info(f"❌ Failed: {statistics['failed']}/{statistics['total_pdfs']}")
+    logger.info(f"📂 Output: {OUTPUT_DIR}")
+    logger.info("=" * 70 + "\n")
 
 if __name__ == "__main__":
-    process_pdfs()
+    try:
+        if not check_dependencies():
+            logger.error("Dependency check failed.")
+            sys.exit(1)
+        
+        if not validate_config():
+            logger.error("Configuration validation failed.")
+            sys.exit(1)
+        
+        process_pdfs()
+        logger.info("🎉 All done!")
+        
+    except KeyboardInterrupt:
+        logger.warning("⏸️  Interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        logger.critical(f"🔥 Critical error: {e}", exc_info=True)
+        sys.exit(1)

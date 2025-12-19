@@ -186,10 +186,13 @@ class PDFExtractorGUI(QMainWindow):
         return """
         QMainWindow { background-color: #FAFAFC; }
         QLabel { color: #1F2937; }
-        QPushButton { color: white; border-radius: 8px; padding: 8px 12px; }
+        /* Default button visible background for material style */
+        QPushButton { background: #52525B; color: white; border-radius: 8px; padding: 8px 12px; border: none; }
         QPushButton[property~="primary"] { background: #6750A4; }
-        QPushButton[property~="accent"] { background: #006E1A; }
-        QPushButton:hover { opacity: 0.95; }
+        QPushButton[property~="accent"] { background: #0B8043; }
+        QPushButton:pressed { transform: translateY(1px); }
+        QPushButton:hover { filter: brightness(1.03); }
+        QPushButton:disabled { background: rgba(15,23,42,0.06); color: rgba(15,23,42,0.3); }
         QFrame#drop_area { border: 2px dashed rgba(99,102,241,0.25); border-radius: 12px; background: linear-gradient(180deg, #FFFFFF, #FBFBFF); }
         QListWidget { background: white; border: 1px solid rgba(15,23,42,0.05); border-radius: 8px; }
         QTextEdit { background-color: #FFFFFF; border: 1px solid rgba(15,23,42,0.05); border-radius: 8px; padding: 8px; }

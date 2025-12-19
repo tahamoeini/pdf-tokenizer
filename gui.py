@@ -147,6 +147,26 @@ class PDFExtractorGUI(QMainWindow):
         self.chk_ocr.setChecked(True)
         right_layout.addWidget(self.chk_ocr)
 
+        self.chk_parallel = QCheckBox("Enable Parallel Processing")
+        self.chk_parallel.setChecked(True)
+        right_layout.addWidget(self.chk_parallel)
+
+        worker_h = QHBoxLayout()
+        worker_h.addWidget(QLabel("Max workers (0=auto):"))
+        self.spin_max_workers = QSpinBox()
+        self.spin_max_workers.setRange(0, 128)
+        self.spin_max_workers.setValue(0)
+        worker_h.addWidget(self.spin_max_workers)
+        right_layout.addLayout(worker_h)
+
+        perpage_h = QHBoxLayout()
+        perpage_h.addWidget(QLabel("Per-page image OCR workers:"))
+        self.spin_per_page = QSpinBox()
+        self.spin_per_page.setRange(1, 16)
+        self.spin_per_page.setValue(2)
+        perpage_h.addWidget(self.spin_per_page)
+        right_layout.addLayout(perpage_h)
+
         hlayout = QHBoxLayout()
         hlayout.addWidget(QLabel("DPI:"))
         self.spin_dpi = QSpinBox()
@@ -315,7 +335,10 @@ class PDFExtractorGUI(QMainWindow):
                 shutil.copy(pdf_file, dest)
 
                 # Process
-                processed_data = extract.process_pdf(dest)
+                processed_data = extract.process_pdf(dest,
+                                                      max_workers=self.spin_max_workers.value(),
+                                                      enable_parallel=self.chk_parallel.isChecked(),
+                                                      per_page_max_workers=self.spin_per_page.value())
                 if processed_data:
                     self.worker_signals.message.emit(f"✓ Completed: {Path(pdf_file).name}")
                     # Show produced outputs in outputs panel

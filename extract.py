@@ -367,13 +367,13 @@ def generate_summary(text_chunks):
     
     return summaries
 
-def process_pdf(pdf_path):
+def process_pdf(pdf_path, max_workers=None, enable_parallel=None, per_page_max_workers=None):
     """Process a single PDF using the modular pipeline and write outputs."""
     try:
         filename = os.path.basename(pdf_path)
         logger.info(f"📖 Processing: {filename}")
 
-        cfg = Config(
+        cfg_kwargs = dict(
             input_paths=[pdf_path],
             output_dir=OUTPUT_DIR,
             ocr_enabled=True,
@@ -383,6 +383,14 @@ def process_pdf(pdf_path):
             preserve_images=PRESERVE_IMAGES,
             formats={"txt", "json", "md"},
         )
+        if max_workers is not None:
+            cfg_kwargs['max_workers'] = int(max_workers)
+        if enable_parallel is not None:
+            cfg_kwargs['enable_parallel'] = bool(enable_parallel)
+        if per_page_max_workers is not None:
+            cfg_kwargs['per_page_max_workers'] = int(per_page_max_workers)
+
+        cfg = Config(**cfg_kwargs)
 
         # Defer OCR check to when OCR is actually used
         if not check_dependencies(ocr_required=False):
@@ -486,6 +494,9 @@ if __name__ == "__main__":
         parser.add_argument("--lang", type=str, default="eng", help="OCR language")
         parser.add_argument("--threshold", type=int, default=40, help="Embedded text length threshold for OCR fallback")
         parser.add_argument("--formats", type=str, default="txt,json,md", help="Comma-separated formats to generate")
+        parser.add_argument("--max-workers", type=int, default=None, help="Max parallel workers (0=auto)")
+        parser.add_argument("--per-page-workers", type=int, default=None, help="Per-page embedded-image OCR workers")
+        parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing")
         args = parser.parse_args()
 
         OUTPUT_DIR = args.output
@@ -500,12 +511,23 @@ if __name__ == "__main__":
             if not check_dependencies(ocr_required=ocr_required):
                 logger.error("Dependency check failed.")
                 sys.exit(1)
-            process_pdfs(args.input)
+            # Pass global parallelism options into per-file processing via process_pdf
+            for pdf_file in os.listdir(args.input):
+                if not pdf_file.lower().endswith('.pdf'):
+                    continue
+                pdf_path = os.path.join(args.input, pdf_file)
+                process_pdf(pdf_path,
+                            max_workers=args.max_workers,
+                            enable_parallel=(not args.no_parallel),
+                            per_page_max_workers=args.per_page_workers)
         else:
             if not check_dependencies(ocr_required=ocr_required):
                 logger.error("Dependency check failed.")
                 sys.exit(1)
-            res = process_pdf(args.input)
+            res = process_pdf(args.input,
+                              max_workers=args.max_workers,
+                              enable_parallel=(not args.no_parallel),
+                              per_page_max_workers=args.per_page_workers)
             if not res:
                 sys.exit(1)
         logger.info("🎉 All done!")

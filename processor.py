@@ -117,6 +117,31 @@ class DocumentProcessor:
             if not getattr(self.config, 'enable_parallel', True):
                 max_workers = 1
 
+            # Soft limiter: observe current CPU and available memory and reduce workers if host is busy
+            try:
+                if psutil:
+                    cpu_pct = psutil.cpu_percent(interval=0.25)
+                    avail_mb = int(psutil.virtual_memory().available / (1024 * 1024))
+                    if getattr(self.config, 'log_runtime_metrics', False):
+                        logger.info(f"Runtime resources — CPU: {cpu_pct}%, Available RAM: {avail_mb}MB")
+                    # If CPU is high, be conservative
+                    if cpu_pct and cpu_pct > getattr(self.config, 'cpu_soft_limit_percent', 80):
+                        reduced = max(1, int(max_workers * 0.5))
+                        logger.info(f"High CPU ({cpu_pct}%), reducing workers {max_workers} -> {reduced}")
+                        max_workers = reduced
+                    # If available memory is low relative to estimate, reduce workers
+                    try:
+                        est_needed = max_workers * max(1, getattr(self.config, 'worker_mem_estimate_mb', 512))
+                        if avail_mb and avail_mb < est_needed:
+                            new_by_mem = max(1, avail_mb // max(1, getattr(self.config, 'worker_mem_estimate_mb', 512)))
+                            if new_by_mem < max_workers:
+                                logger.info(f"Low memory ({avail_mb}MB), reducing workers {max_workers} -> {new_by_mem}")
+                                max_workers = new_by_mem
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             logger.debug(f"Parallel workers: {max_workers} (cpu={cpu_count}, auto={auto_workers})")
 
             # Worker function
@@ -150,17 +175,36 @@ class DocumentProcessor:
                         rels = [os.path.relpath(p, base_dir).replace('\\', '/') for p in embeds]
                         image_files.extend(rels)
                         if self.config.ocr_enabled:
-                            for p, rel in zip(embeds, rels):
+                                # Optionally OCR embedded images in parallel (bounded per page)
                                 try:
                                     ensure_tesseract_available()
-                                    img_e = Image.open(p)
-                                    pre_e = preprocess_image(img_e)
-                                    ocr_e = ocr_image_with_layout(pre_e, lang=self.config.lang)
-                                    text_e = (ocr_e.get('text') or '').strip() if isinstance(ocr_e, dict) else (ocr_e or '')
-                                    embedded_images.append({'path': rel, 'text': text_e, 'ocr_data': ocr_e.get('data') if isinstance(ocr_e, dict) else None})
+                                    per_page_workers = max(1, getattr(self.config, 'per_page_max_workers', 1))
+                                    def _ocr_emb(p_local, rel_local):
+                                        try:
+                                            img_e = Image.open(p_local)
+                                            pre_e = preprocess_image(img_e)
+                                            ocr_e = ocr_image_with_layout(pre_e, lang=self.config.lang)
+                                            text_e = (ocr_e.get('text') or '').strip() if isinstance(ocr_e, dict) else (ocr_e or '')
+                                            return {'path': rel_local, 'text': text_e, 'ocr_data': ocr_e.get('data') if isinstance(ocr_e, dict) else None}
+                                        except Exception as e:
+                                            logger.debug(f"Embedded image OCR failed for {p_local}: {e}")
+                                            return {'path': rel_local, 'text': '', 'ocr_data': None}
+
+                                    if len(embeds) <= 1 or per_page_workers <= 1:
+                                        # small pages — do sequentially
+                                        for p, rel in zip(embeds, rels):
+                                            embedded_images.append(_ocr_emb(p, rel))
+                                    else:
+                                        # run small ThreadPool per-page to OCR embedded images concurrently
+                                        with concurrent.futures.ThreadPoolExecutor(max_workers=min(per_page_workers, len(embeds))) as img_ex:
+                                            futs = [img_ex.submit(_ocr_emb, p, rel) for p, rel in zip(embeds, rels)]
+                                            for f in concurrent.futures.as_completed(futs):
+                                                try:
+                                                    embedded_images.append(f.result())
+                                                except Exception:
+                                                    embedded_images.append({'path': '', 'text': '', 'ocr_data': None})
                                 except Exception as e:
-                                    logger.debug(f"Embedded image OCR failed for {p}: {e}")
-                                    embedded_images.append({'path': rel, 'text': '', 'ocr_data': None})
+                                    logger.debug(f"Embedded image OCR (parallel) failed for page {page_num}: {e}")
                         else:
                             embedded_images = [{'path': rel, 'text': '', 'ocr_data': None} for rel in rels]
                     except Exception as e:
@@ -233,22 +277,32 @@ class DocumentProcessor:
                 return result
 
             # Execute work plan with ThreadPoolExecutor to avoid pickling issues and keep memory under control
+            results_by_page: Dict[int, PageResult] = {}
+            produced_by_page: Dict[int, List[str]] = {}
+
             if max_workers <= 1:
                 for item in work_plan:
                     res = _process_page_item(item)
-                    pages.append(res['page'])
-                    produced.extend(res['produced'])
+                    pg = res['page']
+                    results_by_page[pg.page_number] = pg
+                    produced_by_page[pg.page_number] = res.get('produced', [])
             else:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futures = {ex.submit(_process_page_item, item): item for item in work_plan}
                     for fut in concurrent.futures.as_completed(futures):
+                        item = futures.get(fut)
                         try:
                             res = fut.result()
-                            pages.append(res['page'])
-                            produced.extend(res['produced'])
+                            pg = res['page']
+                            results_by_page[pg.page_number] = pg
+                            produced_by_page[pg.page_number] = res.get('produced', [])
                         except Exception as e:
-                            item = futures.get(fut)
                             logger.debug(f"Page processing failed for item {item}: {e}")
+
+            # Reconstruct ordered pages and produced files by ascending page number
+            for page_num in sorted(results_by_page.keys()):
+                pages.append(results_by_page[page_num])
+                produced.extend(produced_by_page.get(page_num, []))
 
         # Exporters
         produced_files: List[str] = []

@@ -25,6 +25,11 @@ class Config:
     enable_parallel: bool = True
     max_workers: int = 0  # 0 = auto (based on CPU & memory)
     worker_mem_estimate_mb: int = 512  # rough memory estimate per worker
+    # Per-page concurrency for embedded-image OCR (small, bounded to limit memory)
+    per_page_max_workers: int = 2
+    # Runtime metrics & soft-limiter
+    log_runtime_metrics: bool = True
+    cpu_soft_limit_percent: int = 80
 
     def wants(self, fmt: str) -> bool:
         return fmt.lower() in self.formats

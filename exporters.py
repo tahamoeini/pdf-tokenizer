@@ -63,6 +63,28 @@ class MarkdownExporter:
             images = p.get("image_files") or []
             for rel in images:
                 md.append(f"![Page {p['page_number']}]({rel})\n\n")
+
+            # Embedded images metadata (with OCR text)
+            embedded = p.get("embedded_images") or []
+            for ei in embedded:
+                rel = ei.get('path')
+                text_e = ei.get('text') or ''
+                if rel:
+                    md.append(f"![Embedded image p{p['page_number']}]({rel})\n\n")
+                if text_e:
+                    md.append(f"**Extracted from image:**\n\n{text_e}\n\n")
+            # Diagrams
+            diagrams = p.get("diagrams") or []
+            for d in diagrams:
+                md.append(f"**Detected diagram image:** {d.get('image')}\n\n")
+                for shape in d.get('shapes', []):
+                    bbox = shape.get('bbox')
+                    if bbox:
+                        md.append(f"- Shape bbox: {bbox}, type: {shape.get('type')}\n")
+                        if shape.get('text'):
+                            md.append(f"  - Text: {shape.get('text')}\n")
+                if d.get('edges'):
+                    md.append(f"- Edges (line segments): {len(d.get('edges'))}\n\n")
             md.append("---\n\n")
 
         out = os.path.join(self.base_dir, "output.md")

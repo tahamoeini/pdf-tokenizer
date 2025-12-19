@@ -11,6 +11,7 @@ from config import Config
 from renderer import render_page_to_image, extract_embedded_images
 from ocr import ensure_tesseract_available, preprocess_image, ocr_image_with_layout
 from exporters import TextExporter, JsonExporter, MarkdownExporter
+from diagram import detect_diagrams
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,8 @@ class PageResult:
     text_source: str  # "embedded" or "ocr"
     image_files: List[str] = field(default_factory=list)
     ocr_blocks: Optional[Dict[str, Any]] = None
+    embedded_images: List[Dict[str, Any]] = field(default_factory=list)
+    diagrams: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -80,11 +83,54 @@ class DocumentProcessor:
                 image_files.append(os.path.relpath(page_render_path, base_dir).replace('\\', '/'))
 
                 # Extract embedded images (optional but useful)
+                embedded_images = []
                 if self.config.preserve_images:
                     embeds = extract_embedded_images(pdf_path, idx, extracted_dir)
                     for p in embeds:
                         produced.append(p)
-                    image_files.extend([os.path.relpath(p, base_dir).replace('\\', '/') for p in embeds])
+                    rels = [os.path.relpath(p, base_dir).replace('\\', '/') for p in embeds]
+                    image_files.extend(rels)
+
+                    # OCR each embedded image and collect extracted text
+                    embedded_images = []
+                    if self.config.ocr_enabled:
+                        for p, rel in zip(embeds, rels):
+                            try:
+                                ensure_tesseract_available()
+                                img_e = Image.open(p)
+                                pre_e = preprocess_image(img_e)
+                                ocr_e = ocr_image_with_layout(pre_e, lang=self.config.lang)
+                                text_e = (ocr_e.get('text') or '').strip() if isinstance(ocr_e, dict) else (ocr_e or '')
+                                embedded_images.append({
+                                    'path': rel,
+                                    'text': text_e,
+                                    'ocr_data': ocr_e.get('data') if isinstance(ocr_e, dict) else None,
+                                })
+                            except Exception as e:
+                                logger.debug(f"Embedded image OCR failed for {p}: {e}")
+                                embedded_images.append({'path': rel, 'text': '', 'ocr_data': None})
+                    else:
+                        # If OCR disabled, include path placeholders
+                        embedded_images = [{'path': rel, 'text': '', 'ocr_data': None} for rel in rels]
+
+                # Run diagram detection on the rendered page image and embedded images
+                diagrams_found = []
+                try:
+                    # page-level diagrams
+                    page_diags = detect_diagrams(page_render_path, ocr_lang=self.config.lang)
+                    if page_diags:
+                        diagrams_found.extend(page_diags)
+                    # embedded image diagrams
+                    if self.config.preserve_images:
+                        for p in embeds:
+                            try:
+                                ed = detect_diagrams(p, ocr_lang=self.config.lang)
+                                if ed:
+                                    diagrams_found.extend(ed)
+                            except Exception:
+                                continue
+                except Exception as e:
+                    logger.debug(f"Diagram detection error: {e}")
 
                 text_source = "embedded"
                 text_value = embedded_norm
@@ -105,6 +151,8 @@ class DocumentProcessor:
                     text_source=text_source,
                     image_files=image_files,
                     ocr_blocks=ocr_blocks,
+                    embedded_images=embedded_images,
+                    diagrams=diagrams_found,
                 ))
 
         # Exporters
@@ -112,8 +160,18 @@ class DocumentProcessor:
         textexp = TextExporter(base_dir)
         full_text_acc: List[str] = []
         for p in pages:
-            full_text_acc.append(p.text)
-            produced_files.append(textexp.write_page(p.page_number, p.text))
+            # Append page text and any embedded image OCR text
+            page_parts: List[str] = []
+            if p.text:
+                page_parts.append(p.text)
+            for ei in getattr(p, 'embedded_images', []):
+                if ei.get('text'):
+                    page_parts.append(f"[Embedded image: {ei.get('path')}]")
+                    page_parts.append(ei.get('text'))
+
+            page_text_combined = "\n\n".join(page_parts).strip()
+            full_text_acc.append(page_text_combined)
+            produced_files.append(textexp.write_page(p.page_number, page_text_combined))
         produced_files.append(textexp.write_full("\n\n".join(full_text_acc)))
 
         # JSON
@@ -132,6 +190,8 @@ class DocumentProcessor:
                         "text_source": p.text_source,
                         "text": p.text,
                         "image_files": p.image_files,
+                            "embedded_images": p.embedded_images,
+                            "diagrams": p.diagrams,
                     }
                     for p in pages
                 ],
@@ -146,6 +206,7 @@ class DocumentProcessor:
                     "page_number": p.page_number,
                     "text": p.text,
                     "image_files": p.image_files,
+                    "embedded_images": p.embedded_images,
                 } for p in pages
             ], metadata={"title": metadata.get("title") or filename, "page_count": page_count, "filename": filename}))
 

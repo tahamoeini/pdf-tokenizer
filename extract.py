@@ -22,6 +22,10 @@ from pathlib import Path
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
+# Modular pipeline
+from config import Config
+from processor import DocumentProcessor
+
 # --- Logging Configuration ---
 def setup_logging(output_dir):
     """Initialize logging system."""
@@ -48,17 +52,21 @@ def setup_logging(output_dir):
     return logger
 
 # --- Dependency & Environment Checks ---
-def check_dependencies():
-    """Verify all required dependencies are installed and accessible."""
+def check_dependencies(ocr_required: bool = True):
+    """Verify required dependencies; fail fast if OCR requested but unavailable."""
     logger = logging.getLogger(__name__)
     issues = []
     
     # Check Tesseract OCR
-    try:
-        pytesseract.get_tesseract_version()
-        logger.info("✅ Tesseract OCR found")
-    except pytesseract.TesseractNotFoundError:
-        issues.append("❌ Tesseract OCR not found. Install from: https://github.com/UB-Mannheim/tesseract/wiki")
+    if ocr_required:
+        try:
+            pytesseract.get_tesseract_version()
+            logger.info("✅ Tesseract OCR found")
+        except pytesseract.TesseractNotFoundError:
+            issues.append(
+                "❌ Tesseract OCR not found. Install from: https://github.com/UB-Mannheim/tesseract/wiki\n"
+                "   Or set pytesseract.pytesseract.tesseract_cmd to the tesseract.exe path."
+            )
     
     # Check NLTK resources
     for resource in ['tokenizers/punkt', 'tokenizers/punkt_tab']:
@@ -104,11 +112,8 @@ def validate_config():
         logger.error(f"❌ Input directory '{INPUT_DIR}' not found!")
         return False
     
-    if OUTPUT_FORMAT not in ["markdown", "json"]:
-        logger.error(f"❌ Invalid OUTPUT_FORMAT. Use 'markdown' or 'json'")
-        return False
-    
-    logger.info(f"✅ Configuration validated (Output: {OUTPUT_FORMAT})")
+    # OUTPUT_FORMAT retained for backward-compat; exporters are controlled internally
+    logger.info(f"✅ Configuration validated (Output dir: {OUTPUT_DIR})")
     return True
 
 # Ensure output directory exists
@@ -129,66 +134,16 @@ def estimate_tokens(text):
         return len(text) // 4
 
 def preprocess_image(img_pil):
-    """Preprocesses an image for better OCR accuracy."""
-    try:
-        # Convert to grayscale and upscale for better OCR
-        img = np.array(img_pil.convert("L"))
-        h, w = img.shape[:2]
-        scale = 2 if max(w, h) < 2000 else 1
-        if scale != 1:
-            img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-
-        # Denoise and enhance contrast
-        img = cv2.fastNlMeansDenoising(img, None, h=10)
-        img = cv2.equalizeHist(img)
-
-        # Adaptive thresholding for varying backgrounds
-        img = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 35, 15)
-
-        # Morphological closing to connect broken strokes
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel)
-
-        return Image.fromarray(img)
-    except Exception as e:
-        logger.warning(f"⚠️ Image preprocessing failed: {e}")
-        return img_pil
+    """Shim to new OCR module for backward compatibility."""
+    from ocr import preprocess_image as _pre
+    return _pre(img_pil)
 
 
 def ocr_image_with_layout(img_pil, lang='eng'):
-    """Run OCR and return text using layout-aware parsing (word->line grouping).
-    Returns a cleaned textual representation that preserves layout order.
-    """
-    try:
-        # Use image_to_data to get word-level boxes and line numbers
-        data = pytesseract.image_to_data(img_pil, lang=lang, output_type=pytesseract.Output.DICT)
-        n_boxes = len(data.get('level', []))
-        lines = {}
-        for i in range(n_boxes):
-            block = data['block_num'][i]
-            par = data['par_num'][i]
-            line = data['line_num'][i]
-            text = data['text'][i].strip()
-            if not text:
-                continue
-            key = (block, par, line)
-            lines.setdefault(key, []).append(text)
-
-        ordered = []
-        for key in sorted(lines.keys()):
-            ordered.append(' '.join(lines[key]))
-
-        # Fallback to plain OCR string if nothing found
-        raw = pytesseract.image_to_string(img_pil, lang=lang)
-        text = '\n'.join(ordered) if ordered else raw
-        return text.strip()
-    except Exception as e:
-        logger.debug(f"⚠️ OCR layout parsing failed: {e}")
-        try:
-            return pytesseract.image_to_string(img_pil, lang=lang)
-        except Exception:
-            return ""
+    """Shim to new OCR module for backward compatibility."""
+    from ocr import ocr_image_with_layout as _ocr
+    result = _ocr(img_pil, lang=lang)
+    return result.get("text", "")
 
 def extract_pdf_metadata(pdf_path):
     """Extracts metadata from PDF."""
@@ -210,54 +165,22 @@ def extract_pdf_metadata(pdf_path):
         return {}
 
 def extract_images_and_charts(pdf_path, page_num, output_subdir):
-    """Extracts images from a PDF page and converts to text."""
-    images_data = []
-    
+    """Compatibility shim; extraction now handled in renderer.extract_embedded_images."""
     try:
-        doc = fitz.open(pdf_path)
-        page = doc[page_num]
-        image_list = page.get_images(full=True)
-        
-        for img_index, img in enumerate(image_list):
-            try:
-                xref = img[0]
-                pix = fitz.Pixmap(doc, xref)
-                
-                if pix.n - pix.alpha < 4:
-                    pix = fitz.Pixmap(fitz.csRGB, pix)
-                
-                img_path = os.path.join(output_subdir, f"page_{page_num + 1}_img_{img_index + 1}.png")
-                pix.save(img_path)
-                
-                # Extract text from image using improved OCR + layout parsing
-                img_pil = Image.open(img_path)
-                pre = preprocess_image(img_pil)
-                img_text = ocr_image_with_layout(pre, lang='eng')
-                
-                if not img_text.strip():
-                    # As a fallback, try plain OCR again
-                    img_text = pytesseract.image_to_string(pre, lang='eng')
-
-                images_data.append({
-                    "type": "image",
-                    "page": page_num + 1,
-                    "index": img_index + 1,
-                    "path": img_path,
-                    "extracted_text": img_text.strip() if img_text.strip() else "[Visual content - diagram/chart/image]",
-                    "markdown_ref": f"![Image p{page_num + 1}](extracted_images/page_{page_num + 1}_img_{img_index + 1}.png)"
-                })
-                
-                logger.debug(f"📸 Extracted image from page {page_num + 1}")
-                
-            except Exception as e:
-                logger.debug(f"⚠️ Failed to extract image {img_index}: {e}")
-                continue
-        
-        doc.close()
-        return images_data
-        
-    except Exception as e:
-        logger.debug(f"⚠️ Error extracting images: {e}")
+        from renderer import extract_embedded_images
+        paths = extract_embedded_images(pdf_path, page_num, output_subdir)
+        data = []
+        for i, p in enumerate(paths):
+            data.append({
+                "type": "image",
+                "page": page_num + 1,
+                "index": i + 1,
+                "path": p,
+                "extracted_text": "",
+                "markdown_ref": f"![Image p{page_num + 1}](extracted_images/{os.path.basename(p)})"
+            })
+        return data
+    except Exception:
         return []
 
 def extract_with_structure(pdf_path, output_subdir):
@@ -445,73 +368,37 @@ def generate_summary(text_chunks):
     return summaries
 
 def process_pdf(pdf_path):
-    """Main PDF processing pipeline."""
+    """Process a single PDF using the modular pipeline and write outputs."""
     try:
         filename = os.path.basename(pdf_path)
         logger.info(f"📖 Processing: {filename}")
-        
-        # Create subdirectory for this PDF's images
-        pdf_images_dir = os.path.join(OUTPUT_DIR, IMAGES_SUBDIR, filename.replace('.pdf', ''))
-        os.makedirs(pdf_images_dir, exist_ok=True)
-        
-        # Extract metadata
-        metadata = extract_pdf_metadata(pdf_path) if EXTRACT_METADATA else {}
-        
-        # Extract content with structure
-        structured_content = extract_with_structure(pdf_path, pdf_images_dir)
-        
-        if not structured_content:
-            logger.warning(f"⚠️ No content extracted from {filename}")
-            return None
 
-        # Prepare output based on format
-        if OUTPUT_FORMAT == "markdown":
-            # Generate markdown document
-            pdf_data = {
-                "filename": filename,
-                "metadata": metadata
-            }
-            md_content = convert_to_markdown(pdf_data, structured_content)
-            
-            # Save markdown file
-            md_filename = os.path.join(OUTPUT_DIR, filename.replace('.pdf', '.md'))
-            with open(md_filename, 'w', encoding='utf-8') as f:
-                f.write(md_content)
-            
-            logger.info(f"✅ Generated markdown: {md_filename}")
-            
-            return {
-                "filename": filename,
-                "output": md_filename,
-                "format": "markdown",
-                "pages": len(structured_content)
-            }
-        
-        else:  # JSON format
-            # Generate chunks and Q&A
-            full_text = "\n".join([
-                elem.get("content", "") 
-                for page in structured_content 
-                for elem in page.get("elements", [])
-            ])
-            
-            text_chunks = split_into_chunks(full_text)
-            
-            output = {
-                "filename": filename,
-                "metadata": metadata,
-                "chunks": text_chunks,
-                "chunk_count": len(text_chunks)
-            }
-            
-            if QA_GENERATION:
-                output["qa_pairs"] = generate_qa_pairs(text_chunks)
-            
-            if SUMMARY_GENERATION:
-                output["summaries"] = generate_summary(text_chunks)
-            
-            logger.info(f"✅ Processed {filename}: {len(text_chunks)} chunks")
-            return output
+        cfg = Config(
+            input_paths=[pdf_path],
+            output_dir=OUTPUT_DIR,
+            ocr_enabled=True,
+            dpi=300,
+            lang='eng',
+            embedded_text_threshold=40,
+            preserve_images=PRESERVE_IMAGES,
+            formats={"txt", "json", "md"},
+        )
+
+        # Defer OCR check to when OCR is actually used
+        if not check_dependencies(ocr_required=False):
+            raise RuntimeError("Dependencies missing. See log for details.")
+
+        processor = DocumentProcessor(cfg)
+        result = processor.process(pdf_path)
+
+        for p in result.produced_files:
+            logger.info(f"💾 Wrote: {p}")
+
+        return {
+            "filename": result.filename,
+            "pages": result.page_count,
+            "outputs": result.produced_files,
+        }
 
     except Exception as e:
         logger.error(f"❌ Error processing {pdf_path}: {e}", exc_info=True)
@@ -521,7 +408,7 @@ def process_pdfs(input_dir=INPUT_DIR):
     """Batch process all PDFs in directory."""
     logger.info("=" * 70)
     logger.info("PDF TOKENIZER & STRUCTURE EXTRACTOR - Starting Processing")
-    logger.info(f"Output Format: {OUTPUT_FORMAT.upper()}")
+    logger.info(f"Output Formats: txt, json, md")
     logger.info("=" * 70)
     
     pdf_files = [f for f in os.listdir(input_dir) if f.lower().endswith(".pdf")]
@@ -538,7 +425,7 @@ def process_pdfs(input_dir=INPUT_DIR):
         "total_pdfs": len(pdf_files),
         "successful": 0,
         "failed": 0,
-        "format": OUTPUT_FORMAT,
+        "formats": ["txt", "json", "md"],
         "start_time": datetime.now().isoformat()
     }
 
@@ -568,12 +455,11 @@ def process_pdfs(input_dir=INPUT_DIR):
             f.write("\n".join(failed_pdfs))
         logger.warning(f"⚠️ {len(failed_pdfs)} failed PDFs logged")
 
-    # Save data
-    if OUTPUT_FORMAT == "json":
-        output_json = os.path.join(OUTPUT_DIR, "processed_data.json")
-        with open(output_json, "w", encoding="utf-8") as f:
-            json.dump(all_data, f, indent=2, ensure_ascii=False)
-        logger.info(f"💾 Data saved to: {output_json}")
+    # Save run index
+    output_json = os.path.join(OUTPUT_DIR, "processed_data.json")
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(all_data, f, indent=2, ensure_ascii=False)
+    logger.info(f"💾 Run index saved to: {output_json}")
 
     # Save statistics
     stats_file = os.path.join(OUTPUT_DIR, "processing_stats.json")
@@ -590,18 +476,40 @@ def process_pdfs(input_dir=INPUT_DIR):
     logger.info("=" * 70 + "\n")
 
 if __name__ == "__main__":
+    import argparse
     try:
-        if not check_dependencies():
-            logger.error("Dependency check failed.")
-            sys.exit(1)
-        
+        parser = argparse.ArgumentParser(description="PDF Tokenizer & Structure Extractor")
+        parser.add_argument("--input", "-i", help="PDF file or directory (defaults to resources)", default=INPUT_DIR)
+        parser.add_argument("--output", "-o", help="Output directory", default=OUTPUT_DIR)
+        parser.add_argument("--no-ocr", action="store_true", help="Disable OCR fallback")
+        parser.add_argument("--dpi", type=int, default=300, help="DPI for page rendering")
+        parser.add_argument("--lang", type=str, default="eng", help="OCR language")
+        parser.add_argument("--threshold", type=int, default=40, help="Embedded text length threshold for OCR fallback")
+        parser.add_argument("--formats", type=str, default="txt,json,md", help="Comma-separated formats to generate")
+        args = parser.parse_args()
+
+        OUTPUT_DIR = args.output
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
         if not validate_config():
             logger.error("Configuration validation failed.")
             sys.exit(1)
-        
-        process_pdfs()
+
+        ocr_required = not args.no_ocr
+        if os.path.isdir(args.input):
+            if not check_dependencies(ocr_required=ocr_required):
+                logger.error("Dependency check failed.")
+                sys.exit(1)
+            process_pdfs(args.input)
+        else:
+            if not check_dependencies(ocr_required=ocr_required):
+                logger.error("Dependency check failed.")
+                sys.exit(1)
+            res = process_pdf(args.input)
+            if not res:
+                sys.exit(1)
         logger.info("🎉 All done!")
-        
+
     except KeyboardInterrupt:
         logger.warning("⏸️  Interrupted by user")
         sys.exit(0)

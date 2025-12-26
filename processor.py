@@ -47,6 +47,7 @@ class DocumentResult:
     metadata: Dict[str, Any]
     pages: List[PageResult]
     produced_files: List[str]
+    runtime_stats: Dict[str, Any] = field(default_factory=dict)
 
 
 class DocumentProcessor:
@@ -78,26 +79,42 @@ class DocumentProcessor:
 
         pages: List[PageResult] = []
         produced: List[str] = []
+        doc_start_time = time.time()
+        resource_snapshot = {'cpu_percent': None, 'available_ram_mb': None}
 
         with pdfplumber.open(pdf_path) as pdf:
             page_count = page_count or len(pdf.pages)
             # Two-phase approach: quick embedded-text scan, then parallel heavy processing
-            embedded_texts: List[str] = []
+            def analyze_text_quality(text_value: str) -> Dict[str, Any]:
+                normalized = text_value or ""
+                length = len(normalized)
+                alnum = sum(1 for ch in normalized if ch.isalnum())
+                ratio = (alnum / length) if length else 0.0
+                min_required = max(
+                    getattr(self.config, 'embedded_text_threshold', 0),
+                    getattr(self.config, 'ocr_text_min_length', 0),
+                )
+                needs_ocr = (length == 0) or (length < min_required) or (
+                    ratio < getattr(self.config, 'ocr_alnum_ratio_min', 0.0)
+                )
+                return {
+                    'length': length,
+                    'alnum_ratio': ratio,
+                    'min_required_length': min_required,
+                    'needs_ocr': needs_ocr,
+                }
+
+            work_plan: List[Dict[str, Any]] = []
             for idx, page in enumerate(pdf.pages):
                 embedded = page.extract_text() or ""
                 embedded_norm = "\n".join([ln.strip() for ln in embedded.splitlines()]).strip()
-                embedded_texts.append(embedded_norm)
-
-            # Decide work per page
-            work_plan: List[Dict[str, Any]] = []
-            for idx, embedded_norm in enumerate(embedded_texts):
-                use_ocr = self.config.ocr_enabled and (len(embedded_norm) < self.config.embedded_text_threshold)
-                render_needed = use_ocr or self.config.preserve_images
+                stats = analyze_text_quality(embedded_norm)
+                use_ocr = self.config.ocr_enabled and stats.get('needs_ocr', False)
                 work_plan.append({
                     'idx': idx,
                     'embedded_text': embedded_norm,
                     'use_ocr': use_ocr,
-                    'render_needed': render_needed,
+                    'text_stats': stats,
                 })
 
             # Compute adaptive worker count
@@ -122,6 +139,8 @@ class DocumentProcessor:
                 if psutil:
                     cpu_pct = psutil.cpu_percent(interval=0.25)
                     avail_mb = int(psutil.virtual_memory().available / (1024 * 1024))
+                    resource_snapshot['cpu_percent'] = cpu_pct
+                    resource_snapshot['available_ram_mb'] = avail_mb
                     if getattr(self.config, 'log_runtime_metrics', False):
                         logger.info(f"Runtime resources — CPU: {cpu_pct}%, Available RAM: {avail_mb}MB")
                     # If CPU is high, be conservative
@@ -151,30 +170,40 @@ class DocumentProcessor:
                 page_start_time = time.time()
                 embedded_text = item['embedded_text']
                 use_ocr = item['use_ocr']
-                page_render_path = None
+                text_stats = item.get('text_stats') or {}
+                page_render_path: Optional[str] = None
+                page_render_rel: Optional[str] = None
                 produced_files_local: List[str] = []
 
-                if item['render_needed']:
+                def ensure_page_rendered() -> Optional[str]:
+                    nonlocal page_render_path, page_render_rel
+                    if page_render_path:
+                        return page_render_path
                     try:
                         page_render_path = render_page_to_image(pdf_path, idx, self.config.dpi, images_dir)
                         produced_files_local.append(page_render_path)
+                        page_render_rel = os.path.relpath(page_render_path, base_dir).replace('\\', '/')
                     except Exception as e:
                         logger.debug(f"Render failed for page {page_num}: {e}")
+                        page_render_path = None
+                        page_render_rel = None
+                    return page_render_path
 
                 image_files: List[str] = []
-                if page_render_path:
-                    image_files.append(os.path.relpath(page_render_path, base_dir).replace('\\', '/'))
+                if self.config.preserve_images:
+                    if ensure_page_rendered() and page_render_rel:
+                        image_files.append(page_render_rel)
 
                 embedded_images: List[Dict[str, Any]] = []
                 embeds = []
-                if self.config.preserve_images and page_render_path:
+                if self.config.preserve_images:
                     try:
                         embeds = extract_embedded_images(pdf_path, idx, extracted_dir)
                         for p in embeds:
                             produced_files_local.append(p)
                         rels = [os.path.relpath(p, base_dir).replace('\\', '/') for p in embeds]
                         image_files.extend(rels)
-                        if self.config.ocr_enabled:
+                        if self.config.ocr_enabled and self.config.enable_embedded_image_ocr:
                                 # Optionally OCR embedded images in parallel (bounded per page)
                                 try:
                                     ensure_tesseract_available()
@@ -211,9 +240,15 @@ class DocumentProcessor:
                         logger.debug(f"Embedded images extraction failed for page {page_num}: {e}")
 
                 diagrams_found: List[Dict[str, Any]] = []
-                if page_render_path:
+                if self.config.enable_diagram_detection:
+                    rendered_for_diagram = ensure_page_rendered()
                     try:
-                        page_diags = detect_diagrams(page_render_path, ocr_lang=self.config.lang)
+                        if rendered_for_diagram:
+                            if page_render_rel and page_render_rel not in image_files:
+                                image_files.append(page_render_rel)
+                            page_diags = detect_diagrams(rendered_for_diagram, ocr_lang=self.config.lang)
+                        else:
+                            page_diags = []
                         if page_diags:
                             diagrams_found.extend(page_diags)
                         if self.config.preserve_images:
@@ -234,11 +269,12 @@ class DocumentProcessor:
                 if use_ocr:
                     try:
                         ensure_tesseract_available()
-                        if not page_render_path:
-                            page_render_path = render_page_to_image(pdf_path, idx, self.config.dpi, images_dir)
-                            produced_files_local.append(page_render_path)
-                            image_files.insert(0, os.path.relpath(page_render_path, base_dir).replace('\\', '/'))
-                        img = Image.open(page_render_path)
+                        rendered = ensure_page_rendered()
+                        if not rendered:
+                            raise RuntimeError("Unable to render page for OCR")
+                        if page_render_rel and page_render_rel not in image_files:
+                            image_files.insert(0, page_render_rel)
+                        img = Image.open(rendered)
                         pre = preprocess_image(img)
                         ocr = ocr_image_with_layout(pre, lang=self.config.lang)
                         ocr_text = (ocr.get('text') or '').strip()
@@ -250,9 +286,12 @@ class DocumentProcessor:
 
                 extraction_time = int((time.time() - page_start_time) * 1000)
                 source_details = {
-                    'embedded_text_length': len(embedded_text),
+                    'embedded_text_length': text_stats.get('length', len(embedded_text)),
+                    'embedded_text_alnum_ratio': text_stats.get('alnum_ratio'),
+                    'min_required_length': text_stats.get('min_required_length', self.config.embedded_text_threshold),
+                    'heuristic_needs_ocr': text_stats.get('needs_ocr', False),
                     'ocr_used': use_ocr,
-                    'threshold': self.config.embedded_text_threshold,
+                    'threshold': text_stats.get('min_required_length', self.config.embedded_text_threshold),
                     'page_rendered': page_render_path is not None,
                     'extraction_time_ms': extraction_time,
                     'text_source': text_source,
@@ -306,7 +345,10 @@ class DocumentProcessor:
 
         # Exporters
         produced_files: List[str] = []
-        textexp = TextExporter(base_dir)
+        wants_txt = self.config.wants("txt")
+        textexp: Optional[TextExporter] = None
+        if wants_txt or self.config.enable_per_page_text_exports:
+            textexp = TextExporter(base_dir)
         full_text_acc: List[str] = []
         for p in pages:
             # Append page text and any embedded image OCR text
@@ -320,8 +362,10 @@ class DocumentProcessor:
 
             page_text_combined = "\n\n".join(page_parts).strip()
             full_text_acc.append(page_text_combined)
-            produced_files.append(textexp.write_page(p.page_number, page_text_combined))
-        produced_files.append(textexp.write_full("\n\n".join(full_text_acc)))
+            if textexp and self.config.enable_per_page_text_exports:
+                produced_files.append(textexp.write_page(p.page_number, page_text_combined))
+        if textexp and wants_txt:
+            produced_files.append(textexp.write_full("\n\n".join(full_text_acc)))
 
         # JSON
         if self.config.wants("json"):
@@ -369,6 +413,15 @@ class DocumentProcessor:
 
         produced_files.extend(produced)
 
+        runtime_stats = {
+            'elapsed_ms': int((time.time() - doc_start_time) * 1000),
+            'cpu_percent': resource_snapshot.get('cpu_percent'),
+            'available_ram_mb': resource_snapshot.get('available_ram_mb'),
+            'max_page_workers': max_workers,
+            'parallel_enabled': max_workers > 1,
+            'pipeline_mode': getattr(self.config, 'pipeline_mode', 'full'),
+        }
+
         return DocumentResult(
             filename=filename,
             input_path=pdf_path,
@@ -376,6 +429,7 @@ class DocumentProcessor:
             metadata=metadata,
             pages=pages,
             produced_files=produced_files,
+            runtime_stats=runtime_stats,
         )
 
     def _tool_versions(self) -> Dict[str, Any]:

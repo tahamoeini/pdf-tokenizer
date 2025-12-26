@@ -1,6 +1,5 @@
 import sys
 import os
-import json
 import threading
 from pathlib import Path
 from PyQt5.QtWidgets import (
@@ -9,9 +8,8 @@ from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QListWidget, QListWidgetItem, QSplitter, QSizePolicy,
     QSpinBox
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QMimeData
-from PyQt5.QtGui import QDropEvent, QColor, QFont
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtGui import QDropEvent, QFont
 
 # Import the extractor module
 import extract
@@ -52,6 +50,7 @@ class PDFExtractorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.output_folder = None
+        self.active_output_dir = Path(extract.OUTPUT_DIR).resolve()
         self.worker_signals = WorkerSignals()
         self.pdf_files = []
         self.init_ui()
@@ -117,6 +116,10 @@ class PDFExtractorGUI(QMainWindow):
         open_output_btn.clicked.connect(self.open_output_folder)
         action_row.addWidget(open_output_btn)
 
+        set_output_btn = QPushButton("Set Output")
+        set_output_btn.clicked.connect(self.select_output_folder)
+        action_row.addWidget(set_output_btn)
+
         left_layout.addLayout(action_row)
 
         # Progress and log
@@ -143,6 +146,11 @@ class PDFExtractorGUI(QMainWindow):
         settings_title.setStyleSheet("margin-bottom:8px;")
         right_layout.addWidget(settings_title)
 
+        self.output_path_label = QLabel(f"Output: {self.active_output_dir}")
+        self.output_path_label.setWordWrap(True)
+        self.output_path_label.setStyleSheet("color:#475467;")
+        right_layout.addWidget(self.output_path_label)
+
         self.chk_ocr = QCheckBox("Enable OCR fallback")
         self.chk_ocr.setChecked(True)
         right_layout.addWidget(self.chk_ocr)
@@ -151,8 +159,20 @@ class PDFExtractorGUI(QMainWindow):
         self.chk_parallel.setChecked(True)
         right_layout.addWidget(self.chk_parallel)
 
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Pipeline mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Full fidelity", "full")
+        self.mode_combo.addItem("Fast text", "fast-text")
+        mode_layout.addWidget(self.mode_combo)
+        right_layout.addLayout(mode_layout)
+
+        self.chk_combined = QCheckBox("Write combined JSONL/TXT outputs")
+        self.chk_combined.setChecked(False)
+        right_layout.addWidget(self.chk_combined)
+
         worker_h = QHBoxLayout()
-        worker_h.addWidget(QLabel("Max workers (0=auto):"))
+        worker_h.addWidget(QLabel("Page workers (0=auto):"))
         self.spin_max_workers = QSpinBox()
         self.spin_max_workers.setRange(0, 128)
         self.spin_max_workers.setValue(0)
@@ -278,7 +298,8 @@ class PDFExtractorGUI(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
             self.output_folder = folder
-            self.output_label.setText(f"Output: {folder}")
+            self.active_output_dir = Path(folder).resolve()
+            self.output_path_label.setText(f"Output: {self.active_output_dir}")
 
     def update_file_label(self):
         """Update file list label."""
@@ -297,50 +318,89 @@ class PDFExtractorGUI(QMainWindow):
         self.log_text.clear()
         self.progress_bar.setValue(0)
 
+    def collect_settings(self):
+        """Capture UI configuration for the background worker."""
+        base_output = self.output_folder or str(Path(extract.OUTPUT_DIR).resolve())
+        max_workers = self.spin_max_workers.value()
+        return {
+            "output_dir": str(Path(base_output).resolve()),
+            "max_workers": max_workers if max_workers > 0 else None,
+            "per_page_workers": self.spin_per_page.value(),
+            "enable_parallel": self.chk_parallel.isChecked(),
+            "pipeline_mode": self.mode_combo.currentData(),
+            "combined": self.chk_combined.isChecked(),
+            "ocr_enabled": self.chk_ocr.isChecked(),
+            "dpi": self.spin_dpi.value(),
+            "lang": self.combo_lang.currentText() or "eng",
+            "embedded_threshold": None,
+        }
+
     def start_extraction(self):
         """Start extraction in a background thread."""
         if not self.pdf_files:
             QMessageBox.warning(self, "No Files", "Please select at least one PDF file.")
             return
+        settings = self.collect_settings()
         self.log_text.clear()
         self.progress_bar.setValue(0)
+        self.outputs_list.clear()
 
         # Run extraction in background
-        thread = threading.Thread(target=self.run_extraction)
+        thread = threading.Thread(target=self.run_extraction, args=(settings,))
         thread.daemon = True
         thread.start()
 
-    def run_extraction(self):
+    def run_extraction(self, settings):
         """Run extraction."""
         try:
             self.worker_signals.message.emit("Starting extraction...")
+            files_to_process = list(self.pdf_files)
+            total_files = len(files_to_process)
+            if total_files == 0:
+                self.worker_signals.message.emit("No files queued. Aborting run.")
+                self.worker_signals.finished.emit()
+                return
 
             # Override output directory if custom folder is selected
-            if self.output_folder:
-                original_output = extract.OUTPUT_DIR
-                extract.OUTPUT_DIR = self.output_folder
-                os.makedirs(self.output_folder, exist_ok=True)
-            else:
-                original_output = extract.OUTPUT_DIR
+            original_output = extract.OUTPUT_DIR
+            desired_output = settings["output_dir"]
+            extract.OUTPUT_DIR = desired_output
+            os.makedirs(desired_output, exist_ok=True)
+            self.active_output_dir = Path(desired_output).resolve()
 
-            # Copy PDFs to resources folder for processing
-            resources_dir = os.path.join(extract.OUTPUT_DIR, "..", "resources")
-            os.makedirs(resources_dir, exist_ok=True)
+            combined_writer = None
+            if settings.get("combined"):
+                combined_writer = extract.CombinedWriter(
+                    True,
+                    os.path.join(desired_output, "combined_articles.jsonl"),
+                    os.path.join(desired_output, "combined_articles.txt"),
+                )
+                combined_writer.prepare()
 
-            for idx, pdf_file in enumerate(self.pdf_files):
+            success_count = 0
+            failure_count = 0
+
+            for idx, pdf_file in enumerate(files_to_process):
                 self.worker_signals.message.emit(f"Processing: {Path(pdf_file).name}")
-                # Copy file to resources
-                import shutil
-                dest = os.path.join(resources_dir, Path(pdf_file).name)
-                shutil.copy(pdf_file, dest)
-
-                # Process
-                processed_data = extract.process_pdf(dest,
-                                                      max_workers=self.spin_max_workers.value(),
-                                                      enable_parallel=self.chk_parallel.isChecked(),
-                                                      per_page_max_workers=self.spin_per_page.value())
+                processed_data = extract.process_pdf(
+                    pdf_file,
+                    max_workers=settings["max_workers"],
+                    enable_parallel=settings["enable_parallel"],
+                    per_page_max_workers=settings["per_page_workers"],
+                    pipeline_mode=settings["pipeline_mode"],
+                    combined_override=combined_writer.enabled if combined_writer else None,
+                    combined_jsonl_path=combined_writer.jsonl_path if combined_writer else None,
+                    combined_txt_path=combined_writer.txt_path if combined_writer else None,
+                    ocr_enabled=settings["ocr_enabled"],
+                    dpi=settings["dpi"],
+                    lang=settings["lang"],
+                    embedded_threshold=settings["embedded_threshold"],
+                )
                 if processed_data:
+                    success_count += 1
                     self.worker_signals.message.emit(f"✓ Completed: {Path(pdf_file).name}")
+                    if combined_writer:
+                        combined_writer.append(processed_data.get("summary"))
                     # Show produced outputs in outputs panel
                     outs = processed_data.get('outputs') or processed_data.get('outputs', [])
                     if isinstance(outs, list):
@@ -349,28 +409,28 @@ class PDFExtractorGUI(QMainWindow):
                             item.setData(Qt.UserRole, p)
                             self.outputs_list.addItem(item)
                 else:
+                    failure_count += 1
                     self.worker_signals.message.emit(f"✗ Failed: {Path(pdf_file).name}")
 
-                progress = int((idx + 1) / len(self.pdf_files) * 100)
+                progress = int((idx + 1) / total_files * 100)
                 self.worker_signals.progress.emit(progress)
 
-            # Save stats
-            stats_file = os.path.join(extract.OUTPUT_DIR, "processing_stats.json")
-            if os.path.exists(stats_file):
-                with open(stats_file, 'r') as f:
-                    stats = json.load(f)
-                    self.worker_signals.message.emit(f"\n✅ Extraction Complete!")
-                    self.worker_signals.message.emit(f"Successful: {stats['successful']}/{stats['total_pdfs']}")
-                    self.worker_signals.message.emit(f"Output folder: {extract.OUTPUT_DIR}")
+            self.worker_signals.message.emit("\n✅ Extraction Complete!")
+            self.worker_signals.message.emit(
+                f"Successful: {success_count}/{total_files} | Failed: {failure_count}"
+            )
+            self.worker_signals.message.emit(f"Output folder: {self.active_output_dir}")
+            if combined_writer and combined_writer.enabled:
+                self.worker_signals.message.emit(
+                    f"Combined outputs saved to {combined_writer.jsonl_path} and {combined_writer.txt_path}"
+                )
 
             self.worker_signals.finished.emit()
 
-            # Restore
-            if self.output_folder:
-                extract.OUTPUT_DIR = original_output
-
         except Exception as e:
             self.worker_signals.error.emit(str(e))
+        finally:
+            extract.OUTPUT_DIR = original_output
 
     def update_progress(self, value):
         """Update progress bar."""
@@ -395,7 +455,7 @@ class PDFExtractorGUI(QMainWindow):
 
     def open_output_folder(self):
         """Open output folder in file explorer."""
-        output = self.output_folder or os.path.join(os.getcwd(), extract.OUTPUT_DIR)
+        output = str(self.active_output_dir)
         if os.path.exists(output):
             os.startfile(output)
         else:

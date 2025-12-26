@@ -1,12 +1,9 @@
 pymupdf
 pdfplumber
 pytesseract
-nltk
 opencv-python-headless
 Pillow
 tqdm
-unidecode
 numpy
-tiktoken
 PyQt5
 PyInstaller

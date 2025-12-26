@@ -18,7 +18,6 @@ def build_exe():
         '--add-data=extract.py:.',
         '--hidden-import=PyQt5',
         '--hidden-import=extract',
-        '--collect-all=nltk',
         '--collect-all=cv2',
     ]
     

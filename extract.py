@@ -2,23 +2,12 @@ import os
 import json
 import sys
 import logging
-import fitz  # PyMuPDF
-import pdfplumber
 import pytesseract
-import unicodedata
-import nltk
-import re
-import cv2
-import numpy as np
-from PIL import Image
 from tqdm import tqdm
-from unidecode import unidecode
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
-import shutil
 import warnings
 import io
-from pathlib import Path
 from typing import Optional, Dict, Any
 
 # Suppress warnings
@@ -70,22 +59,6 @@ def check_dependencies(ocr_required: bool = True):
                 "   Or set pytesseract.pytesseract.tesseract_cmd to the tesseract.exe path."
             )
     
-    # Check NLTK resources
-    for resource in ['tokenizers/punkt', 'tokenizers/punkt_tab']:
-        try:
-            nltk.data.find(resource)
-            logger.info(f"✅ NLTK resource '{resource}' found")
-        except LookupError:
-            logger.info(f"📥 Downloading NLTK resource: {resource}")
-            nltk.download(resource, quiet=True)
-    
-    # Check tiktoken for token counting
-    try:
-        import tiktoken
-        logger.info("✅ tiktoken available for token-based chunking")
-    except ImportError:
-        logger.warning("⚠️ tiktoken not installed. Token-based chunking will use estimate.")
-    
     if issues:
         logger.error(f"Dependency check failed:\n" + "\n".join(issues))
         return False
@@ -95,16 +68,7 @@ def check_dependencies(ocr_required: bool = True):
 # --- CONFIGURATION & VALIDATION ---
 INPUT_DIR = "resources"      # Directory containing PDFs
 OUTPUT_DIR = "processed_data"
-CHUNK_SIZE = 512             # Target chunk size (characters)
-TOKEN_LIMIT = 512            # Max tokens per chunk
-QA_GENERATION = True         # Enable Q&A extraction (JSON mode only)
-SUMMARY_GENERATION = True    # Enable summary generation (JSON mode only)
-EXTRACT_METADATA = True      # Enable PDF metadata extraction
-OUTPUT_FORMAT = "json"   # Output format: "markdown" or "json"
 PRESERVE_IMAGES = True       # Extract and convert images to text
-PRESERVE_STRUCTURE = True    # Preserve document structure
-MIN_CHUNK_LENGTH = 50        # Minimum characters per valid chunk
-IMAGES_SUBDIR = "extracted_images"
 
 COMBINED_SEP_ARTICLE = "===== ARTICLE START ====="
 COMBINED_SEP_TEXT_START = "----- TEXT START -----"
@@ -201,15 +165,6 @@ logger = setup_logging(OUTPUT_DIR)
 
 # --- Helper Functions ---
 
-def estimate_tokens(text):
-    """Estimate token count (1 token ≈ 4 characters for English)."""
-    try:
-        import tiktoken
-        encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-        return len(encoding.encode(text))
-    except (ImportError, KeyError):
-        return len(text) // 4
-
 def preprocess_image(img_pil):
     """Shim to new OCR module for backward compatibility."""
     from ocr import preprocess_image as _pre
@@ -222,230 +177,20 @@ def ocr_image_with_layout(img_pil, lang='eng'):
     result = _ocr(img_pil, lang=lang)
     return result.get("text", "")
 
-def extract_pdf_metadata(pdf_path):
-    """Extracts metadata from PDF."""
-    try:
-        doc = fitz.open(pdf_path)
-        metadata = doc.metadata or {}
-        page_count = len(doc)
-        doc.close()
-        
-        return {
-            "title": metadata.get("title", "Unknown"),
-            "author": metadata.get("author", "Unknown"),
-            "subject": metadata.get("subject", ""),
-            "creator": metadata.get("creator", ""),
-            "page_count": page_count
-        }
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to extract metadata: {e}")
-        return {}
-
-def extract_images_and_charts(pdf_path, page_num, output_subdir):
-    """Compatibility shim; extraction now handled in renderer.extract_embedded_images."""
-    try:
-        from renderer import extract_embedded_images
-        paths = extract_embedded_images(pdf_path, page_num, output_subdir)
-        data = []
-        for i, p in enumerate(paths):
-            data.append({
-                "type": "image",
-                "page": page_num + 1,
-                "index": i + 1,
-                "path": p,
-                "extracted_text": "",
-                "markdown_ref": f"![Image p{page_num + 1}](extracted_images/{os.path.basename(p)})"
-            })
-        return data
-    except Exception:
-        return []
-
-def extract_with_structure(pdf_path, output_subdir):
-    """Extracts text with structure preservation using pdfplumber."""
-    structured_content = []
-    
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                page_content = {
-                    "page": page_num + 1,
-                    "elements": []
-                }
-                
-                # Extract tables
-                tables = page.extract_tables()
-                if tables:
-                    for table_idx, table in enumerate(tables):
-                        if not table:
-                            continue
-                        
-                        # Build markdown table
-                        header = table[0]
-                        table_md = "| " + " | ".join([str(cell) if cell else "" for cell in header]) + " |\n"
-                        table_md += "|" + "|".join(["---"] * len(header)) + "|\n"
-                        
-                        for row in table[1:]:
-                            table_md += "| " + " | ".join([str(cell) if cell else "" for cell in row]) + " |\n"
-                        
-                        page_content["elements"].append({
-                            "type": "table",
-                            "content": table_md.strip()
-                        })
-                
-                # Extract text with structure detection
-                text = page.extract_text()
-                if text:
-                    lines = text.split('\n')
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        
-                        element_type = "paragraph"
-                        
-                        # Detect headings
-                        if len(line) < 100 and (line.isupper() or re.match(r'^(Chapter|Section|Part|Title)', line, re.I)):
-                            element_type = "heading"
-                        
-                        # Detect lists
-                        if line.startswith(("•", "-", "*", "◦", "○")) or re.match(r'^(\d+\.|[a-z]\.|[A-Z]\.)', line):
-                            element_type = "list_item"
-                        
-                        page_content["elements"].append({
-                            "type": element_type,
-                            "content": line
-                        })
-                
-                # Extract images
-                if PRESERVE_IMAGES:
-                    images = extract_images_and_charts(pdf_path, page_num, output_subdir)
-                    for img in images:
-                        page_content["elements"].append({
-                            "type": "image",
-                            "content": img["extracted_text"],
-                            "markdown_ref": img["markdown_ref"]
-                        })
-                
-                if page_content["elements"]:
-                    structured_content.append(page_content)
-        
-        return structured_content
-        
-    except Exception as e:
-        logger.error(f"❌ Error extracting structured content: {e}")
-        return []
-
-def convert_to_markdown(pdf_data, structured_content):
-    """Converts extracted content to markdown with full structure preservation."""
-    md_content = []
-    
-    # Document header with metadata
-    if pdf_data.get("metadata"):
-        meta = pdf_data["metadata"]
-        title = meta.get("title") or pdf_data.get("filename", "Document")
-        md_content.append(f"# {title}\n")
-        
-        if meta.get("author") and meta["author"] != "Unknown":
-            md_content.append(f"**Author:** {meta['author']}")
-        if meta.get("subject"):
-            md_content.append(f"**Subject:** {meta['subject']}")
-        if meta.get("page_count"):
-            md_content.append(f"**Total Pages:** {meta['page_count']}")
-        
-        md_content.append("\n---\n")
-    
-    # Process each page
-    for page_content in structured_content:
-        page_num = page_content["page"]
-        md_content.append(f"## Page {page_num}\n")
-        
-        for element in page_content["elements"]:
-            elem_type = element["type"]
-            content = element.get("content", "").strip()
-            
-            if not content:
-                continue
-            
-            if elem_type == "heading":
-                md_content.append(f"### {content}\n")
-                
-            elif elem_type == "list_item":
-                # Clean and reformat as markdown list
-                cleaned = re.sub(r'^[•\-*◦○]?\s*', '', content)
-                md_content.append(f"- {cleaned}")
-                
-            elif elem_type == "table":
-                md_content.append(f"{content}\n")
-                
-            elif elem_type == "image":
-                if element.get("markdown_ref"):
-                    md_content.append(f"{element['markdown_ref']}\n")
-                
-                if content and "[Visual" not in content:
-                    md_content.append(f"*[Image Content]*: {content}\n")
-                
-            elif elem_type == "paragraph":
-                md_content.append(f"{content}\n")
-        
-        md_content.append("\n---\n")
-    
-    return "\n".join(md_content)
-
-def split_into_chunks(text, chunk_size=CHUNK_SIZE, token_limit=TOKEN_LIMIT):
-    """Splits text into chunks with token awareness (JSON mode only)."""
-    sentences = nltk.sent_tokenize(text)
-    chunks = []
-    current_chunk = ""
-
-    for sentence in sentences:
-        test_chunk = (current_chunk + " " + sentence).strip()
-        
-        if len(test_chunk) < chunk_size and estimate_tokens(test_chunk) < token_limit:
-            current_chunk = test_chunk
-        else:
-            if len(current_chunk.strip()) >= MIN_CHUNK_LENGTH:
-                chunks.append(current_chunk.strip())
-            current_chunk = sentence
-
-    if len(current_chunk.strip()) >= MIN_CHUNK_LENGTH:
-        chunks.append(current_chunk.strip())
-
-    logger.debug(f"📊 Created {len(chunks)} chunks")
-    return chunks
-
-def generate_qa_pairs(text_chunks):
-    """Creates Q&A pairs from chunks (JSON mode only)."""
-    qa_pairs = []
-    
-    for chunk in text_chunks:
-        sentences = nltk.sent_tokenize(chunk)
-        if not sentences:
-            continue
-        
-        qa_pairs.append({
-            "question": "What is the main topic?",
-            "answer": chunk
-        })
-    
-    return qa_pairs
-
-def generate_summary(text_chunks):
-    """Generates summaries from chunks (JSON mode only)."""
-    summaries = []
-    
-    for chunk in text_chunks:
-        sentences = nltk.sent_tokenize(chunk)
-        summary = sentences[0] if sentences else ""
-        
-        summaries.append({
-            "original_text": chunk[:100] + ("..." if len(chunk) > 100 else ""),
-            "summary": summary
-        })
-    
-    return summaries
-
-def process_pdf(pdf_path, max_workers=None, enable_parallel=None, per_page_max_workers=None,
-                pipeline_mode=None, combined_override=None, combined_jsonl_path=None, combined_txt_path=None):
+def process_pdf(
+    pdf_path,
+    max_workers=None,
+    enable_parallel=None,
+    per_page_max_workers=None,
+    pipeline_mode=None,
+    combined_override=None,
+    combined_jsonl_path=None,
+    combined_txt_path=None,
+    ocr_enabled=True,
+    dpi=None,
+    lang=None,
+    embedded_threshold=None,
+):
     """Process a single PDF using the modular pipeline and write outputs."""
     try:
         filename = os.path.basename(pdf_path)
@@ -454,10 +199,10 @@ def process_pdf(pdf_path, max_workers=None, enable_parallel=None, per_page_max_w
         cfg_kwargs = dict(
             input_paths=[pdf_path],
             output_dir=OUTPUT_DIR,
-            ocr_enabled=True,
-            dpi=300,
-            lang='eng',
-            embedded_text_threshold=40,
+            ocr_enabled=bool(ocr_enabled),
+            dpi=dpi or 300,
+            lang=lang or 'eng',
+            embedded_text_threshold=embedded_threshold if embedded_threshold is not None else 40,
             preserve_images=PRESERVE_IMAGES,
             formats={"txt", "json", "md"},
             pipeline_mode=pipeline_mode or "full",
@@ -478,7 +223,7 @@ def process_pdf(pdf_path, max_workers=None, enable_parallel=None, per_page_max_w
         cfg = Config(**cfg_kwargs)
 
         # Defer OCR check to when OCR is actually used
-        if not check_dependencies(ocr_required=False):
+        if not check_dependencies(ocr_required=cfg_kwargs['ocr_enabled']):
             raise RuntimeError("Dependencies missing. See log for details.")
 
         processor = DocumentProcessor(cfg)
@@ -521,8 +266,19 @@ def process_pdf(pdf_path, max_workers=None, enable_parallel=None, per_page_max_w
         logger.error(f"❌ Error processing {pdf_path}: {e}", exc_info=True)
         return None
 
-def process_pdfs(input_dir=INPUT_DIR, pipeline_mode="full", doc_workers=None, max_workers=None,
-                 enable_parallel=None, per_page_max_workers=None, combined_writer: Optional[CombinedWriter] = None):
+def process_pdfs(
+    input_dir=INPUT_DIR,
+    pipeline_mode="full",
+    doc_workers=None,
+    max_workers=None,
+    enable_parallel=None,
+    per_page_max_workers=None,
+    combined_writer: Optional[CombinedWriter] = None,
+    ocr_enabled=True,
+    dpi=None,
+    lang=None,
+    embedded_threshold=None,
+):
     """Batch process all PDFs in a directory with process-level parallelism."""
     logger.info("=" * 70)
     logger.info("PDF TOKENIZER & STRUCTURE EXTRACTOR - Starting Processing")
@@ -589,6 +345,10 @@ def process_pdfs(input_dir=INPUT_DIR, pipeline_mode="full", doc_workers=None, ma
                     combined_override=combined_writer.enabled if combined_writer else None,
                     combined_jsonl_path=combined_writer.jsonl_path if combined_writer else None,
                     combined_txt_path=combined_writer.txt_path if combined_writer else None,
+                    ocr_enabled=ocr_enabled,
+                    dpi=dpi,
+                    lang=lang,
+                    embedded_threshold=embedded_threshold,
                 )
             except Exception as exc:
                 logger.error(f"❌ Exception processing {pdf_file}: {exc}")
@@ -598,20 +358,23 @@ def process_pdfs(input_dir=INPUT_DIR, pipeline_mode="full", doc_workers=None, ma
     else:
         logger.info(f"🧵 Document workers: {doc_workers} (page parallel: {statistics['page_parallel']})")
         with ProcessPoolExecutor(max_workers=doc_workers) as pool:
-            futures = {
-                pool.submit(
-                    process_pdf,
-                    os.path.join(input_dir, pdf_file),
-                    max_workers,
-                    resolved_page_parallel,
-                    per_page_max_workers,
-                    pipeline_mode,
-                    combined_writer.enabled if combined_writer else None,
-                    combined_writer.jsonl_path if combined_writer else None,
-                    combined_writer.txt_path if combined_writer else None,
-                ): pdf_file
-                for pdf_file in pdf_files
-            }
+            futures = {}
+            for pdf_file in pdf_files:
+                pdf_path = os.path.join(input_dir, pdf_file)
+                task_kwargs = dict(
+                    max_workers=max_workers,
+                    enable_parallel=resolved_page_parallel,
+                    per_page_max_workers=per_page_max_workers,
+                    pipeline_mode=pipeline_mode,
+                    combined_override=combined_writer.enabled if combined_writer else None,
+                    combined_jsonl_path=combined_writer.jsonl_path if combined_writer else None,
+                    combined_txt_path=combined_writer.txt_path if combined_writer else None,
+                    ocr_enabled=ocr_enabled,
+                    dpi=dpi,
+                    lang=lang,
+                    embedded_threshold=embedded_threshold,
+                )
+                futures[pool.submit(process_pdf, pdf_path, **task_kwargs)] = pdf_file
             for fut in as_completed(futures):
                 pdf_file = futures[fut]
                 try:
@@ -711,6 +474,10 @@ if __name__ == "__main__":
                 enable_parallel=page_parallel_flag,
                 per_page_max_workers=args.per_page_workers,
                 combined_writer=combined_writer,
+                ocr_enabled=ocr_required,
+                dpi=args.dpi,
+                lang=args.lang,
+                embedded_threshold=args.threshold,
             )
         else:
             if not check_dependencies(ocr_required=ocr_required):
@@ -723,7 +490,11 @@ if __name__ == "__main__":
                               pipeline_mode=args.mode,
                               combined_override=combined_writer.enabled if combined_writer else None,
                               combined_jsonl_path=combined_writer.jsonl_path if combined_writer else None,
-                              combined_txt_path=combined_writer.txt_path if combined_writer else None)
+                              combined_txt_path=combined_writer.txt_path if combined_writer else None,
+                              ocr_enabled=ocr_required,
+                              dpi=args.dpi,
+                              lang=args.lang,
+                              embedded_threshold=args.threshold)
             if not res:
                 sys.exit(1)
             if combined_writer:
